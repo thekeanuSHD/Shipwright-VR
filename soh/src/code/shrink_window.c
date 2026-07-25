@@ -1,12 +1,22 @@
 #include "global.h"
 
+#include <vr_interface.h>
+
 s32 D_8012CED0 = 0;
 
 s32 sShrinkWindowVal = 0;
 s32 sShrinkWindowCurrentVal = 0;
 
+// SOH [VR] The cinematic letterbox (Z-targeting, cutscenes) is meaningless in a headset — the
+// bars just float on the head-locked HUD and shrink your view. Default OFF in VR, opt back in
+// with gVrLetterbox. Flat-screen play keeps stock behavior (and the separate Enhancements
+// "Disable Black Bar Letterboxes" setting still governs it there).
+static s32 Letterbox_VrSuppressed(void) {
+    return VR_IsInitialized() && !CVarGetInteger("gVrLetterbox", 0);
+}
+
 void Letterbox_SetSizeTarget(s32 value) {
-    if (CVarGetInteger(CVAR_ENHANCEMENT("DisableBlackBars"), 0)) {
+    if (CVarGetInteger(CVAR_ENHANCEMENT("DisableBlackBars"), 0) || Letterbox_VrSuppressed()) {
         sShrinkWindowVal = 0;
         return;
     }
@@ -21,7 +31,7 @@ u32 ShrinkWindow_GetVal(void) {
 }
 
 void ShrinkWindow_SetCurrentVal(s32 currentVal) {
-    if (CVarGetInteger(CVAR_ENHANCEMENT("DisableBlackBars"), 0)) {
+    if (CVarGetInteger(CVAR_ENHANCEMENT("DisableBlackBars"), 0) || Letterbox_VrSuppressed()) {
         sShrinkWindowCurrentVal = 0;
         return;
     }

@@ -1434,8 +1434,21 @@ void Play_Draw(PlayState* play) {
             VR_SetFirstPerson(true);
             VR_SetCameraAnchor(vrHead.x, vrHead.y, vrHead.z);
         } else {
+            // #region SOH [VR] Third-person VR — the stock game in stereo 3D: the playspace rides
+            // the game camera exactly (position AND facing, cutscene shots included), with the
+            // player's head adding free look and 6DOF lean on top. Anchor = the active camera's
+            // eye; base yaw = the camera's facing (camDir.y, computed by Camera_Update from the
+            // game's own eye/at BEFORE the VR culling override — no feedback). Pitch/roll are
+            // deliberately not folded in: the horizon must stay level with real gravity, so
+            // vertically-framed shots are matched by tilting your actual head.
+            // IMPORTANT: anchor from the CAMERA's own eye, not play->view.eye — Camera_Update
+            // overwrites the view with the VR pose for culling, and anchoring to that would chase
+            // our own HMD offset in a feedback loop.
+            Camera* vrCam = GET_ACTIVE_CAM(play);
             VR_SetFirstPerson(false);
             sVrFirstPersonWasActive = false;
+            VR_SetCameraAnchor(vrCam->eye.x, vrCam->eye.y, vrCam->eye.z);
+            VR_SetCameraYaw(vrCam->camDir.y);
         }
     }
     // #endregion

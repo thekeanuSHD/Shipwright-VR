@@ -6,7 +6,14 @@
 
 #include <unordered_map>
 
-std::unordered_map<Mtx*, MtxF> FrameInterpolation_Interpolate(float step);
+// Returns a reference to an internally-owned map that is cleared and refilled on every call, so
+// the bucket array survives between frames instead of being rebuilt from scratch. At 120 Hz this
+// runs 120 times a second over every matrix in the frame, and the map used to be constructed and
+// destroyed each time. The result is only valid until the next call — use it, don't store it.
+const std::unordered_map<Mtx*, MtxF>& FrameInterpolation_Interpolate(float step);
+
+// The "no interpolation needed" case (the final sub-frame renders the game's own matrices).
+const std::unordered_map<Mtx*, MtxF>& FrameInterpolation_NoReplacements();
 
 extern "C" {
 

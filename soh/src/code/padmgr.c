@@ -375,13 +375,13 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
 
         // Right thumbstick -> C-buttons (items), digital with a threshold. When snap turning is
         // enabled the X axis belongs to it (handled in the VR layer), so only Y maps to C-buttons —
-        // except in flat-screen menus (file select, pause), where snap turning is suspended and the
-        // full stick navigates/equips (kaleido needs C-left/right to assign items).
+        // except in flat-screen menus (file select, pause) and in THIRD PERSON, where snap turning
+        // is suspended and the stick is pure stock C-buttons (the game owns the camera there).
         float rx = 0.0f, ry = 0.0f;
         VR_GetThumbstick(VR_HAND_RIGHT, &rx, &ry);
         if (ry > 0.5f) vrPad->button |= BTN_CUP;
         if (ry < -0.5f) vrPad->button |= BTN_CDOWN;
-        if (!CVarGetInteger("gVrSnapTurnOn", 1) || VR_IsFlatScreen()) {
+        if (!CVarGetInteger("gVrSnapTurnOn", 1) || VR_IsFlatScreen() || !VR_GetFirstPerson()) {
             if (rx > 0.5f) vrPad->button |= BTN_CRIGHT;
             if (rx < -0.5f) vrPad->button |= BTN_CLEFT;
         }

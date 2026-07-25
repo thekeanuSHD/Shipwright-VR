@@ -1793,6 +1793,13 @@ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
     // Process window events for resize, mouse, keyboard events
     wnd->HandleEvents();
 
+    // SOH [VR] F9 toggles between VR and flat mode. Only the REQUEST is made here (CVar flip);
+    // the switch itself latches at the next game-tick boundary (VR_ApplyModeRequest in graph.c).
+    if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
+        CVarSetInteger("gVrEnabled", !CVarGetInteger("gVrEnabled", 1));
+        CVarSave();
+    }
+
     auto intp = wnd->GetInterpreterWeak().lock().get();
     intp->mInterpolationIndex = 0;
 
@@ -1801,8 +1808,11 @@ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, UIWidgets::ColorValues.at(themeColor));
     for (int i = 0; i < count; i++) {
         time += step;
-        std::unordered_map<Mtx*, MtxF> mtx_replacements =
-            (time == denom) ? std::unordered_map<Mtx*, MtxF>() : FrameInterpolation_Interpolate((float)time / denom);
+        // Bind by reference: both branches return an internally-owned map, so no map is built or
+        // destroyed per sub-frame. Valid only until the next FrameInterpolation_Interpolate call,
+        // which is the next loop iteration — after DrawAndRunGraphicsCommands is done with it.
+        const std::unordered_map<Mtx*, MtxF>& mtx_replacements =
+            (time == denom) ? FrameInterpolation_NoReplacements() : FrameInterpolation_Interpolate((float)time / denom);
         intp->mInterpolationT = (float)time / denom;
         wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements);
         intp->mInterpolationIndex++;

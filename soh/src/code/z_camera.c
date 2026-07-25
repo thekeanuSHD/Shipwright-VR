@@ -7730,13 +7730,16 @@ Vec3s Camera_Update(Camera* camera) {
     // #region SOH [VR] Camera unification — report the VR head pose as the game camera so the
     // engine's CPU-side systems (frustum culling, audio panning via actor->projectedPos,
     // projected-position/LOD) agree with the rendered HMD view. This is what stops geometry popping
-    // in/out as you turn your head. Rendering is unaffected: in first-person, the interpreter builds
-    // clip space from the per-eye VR matrices and skips the game's lookAt, so the game View is used
-    // only CPU-side. We also force view scale to 1.0 (no zoom) and use a wide culling FOV so
-    // peripheral geometry isn't culled. Applied during cutscenes too: in first-person the render is
-    // ALWAYS the HMD view (the player experiences cutscenes from Link's eyes), so culling/audio must
-    // follow the head there as well to stay matched to what's drawn.
-    if (VR_IsInitialized() && VR_GetFirstPerson()) {
+    // in/out as you turn your head. Applies in BOTH VR view modes: VR_GetCameraPose composes
+    // (anchor + HMD offset/orientation), where the anchor is Link's head in first person and the
+    // chase camera's eye in third person — so culling always follows where the player is LOOKING,
+    // not where the game camera points. Rendering is unaffected: the interpreter builds clip space
+    // from the per-eye VR matrices, so the game View is used only CPU-side. We also force view
+    // scale to 1.0 (no zoom) and use a wide culling FOV so peripheral geometry isn't culled.
+    // Applied during cutscenes too (the render is always the HMD view in VR).
+    // NOTE: camDir/inputDir (stick steering) derive from eyeAtAngle, computed above from the game
+    // camera's OWN eye/at — so third-person movement stays camera-relative like flat play.
+    if (VR_IsInitialized()) {
         float vrEye[3], vrFwd[3], vrUp[3];
         VR_GetCameraPose(vrEye, vrFwd, vrUp);
         viewEye.x = vrEye[0];

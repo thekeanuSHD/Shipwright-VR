@@ -283,6 +283,11 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
         return;
     }
 
+    // SOH [VR] Latch any pending VR<->flat toggle here — the tick boundary, BEFORE this tick's
+    // display list is built — so the DL's mode (overlay routing, camera, projections) always
+    // matches the mode it will be rendered in.
+    VR_ApplyModeRequest();
+
     gameState->unk_A0 = 0;
     Graph_InitTHGA(gfxCtx);
 
@@ -296,7 +301,11 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
     CLOSE_DISPS(gfxCtx);
 
     GameState_ReqPadData(gameState);
+    // SOH [VR] Bracketed for the VR performance readout: this runs on the render thread, so its
+    // cost is subtracted from the same 50 ms budget the tick's interpolated sub-frames share.
+    VR_GameTickBegin();
     GameState_Update(gameState);
+    VR_GameTickEnd();
 
     OPEN_DISPS(gfxCtx);
 

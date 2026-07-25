@@ -204,7 +204,9 @@ Data& append(Op op) {
 struct InterpolateCtx {
     float step;
     float w;
-    unordered_map<Mtx*, MtxF> mtx_replacements;
+    // Bound to a persistent map (see FrameInterpolation_Interpolate) rather than owned, so the
+    // bucket array is reused frame to frame.
+    unordered_map<Mtx*, MtxF>& mtx_replacements;
     MtxF tmp_mtxf, tmp_mtxf2;
     Vec3f tmp_vec3f;
     Vec3s tmp_vec3s;
@@ -441,12 +443,21 @@ struct InterpolateCtx {
 
 } // anonymous namespace
 
-unordered_map<Mtx*, MtxF> FrameInterpolation_Interpolate(float step) {
-    InterpolateCtx ctx;
-    ctx.step = step;
-    ctx.w = 1.0f - step;
+const unordered_map<Mtx*, MtxF>& FrameInterpolation_Interpolate(float step) {
+    // Persistent across calls: clear() drops the nodes but keeps the bucket array, so a frame with
+    // a similar matrix count as the last one does no rehashing and no bucket reallocation. The old
+    // code default-constructed the map every call and destroyed it immediately afterwards.
+    static unordered_map<Mtx*, MtxF> mtx_replacements;
+    mtx_replacements.clear();
+
+    InterpolateCtx ctx{ .step = step, .w = 1.0f - step, .mtx_replacements = mtx_replacements };
     ctx.interpolate_branch(&previous_recording.root_path, &current_recording.root_path);
-    return ctx.mtx_replacements;
+    return mtx_replacements;
+}
+
+const unordered_map<Mtx*, MtxF>& FrameInterpolation_NoReplacements() {
+    static const unordered_map<Mtx*, MtxF> empty;
+    return empty;
 }
 
 void FrameInterpolation_StartRecord(void) {

@@ -407,6 +407,24 @@ elseif ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU|Clang|AppleClang")
     )
 endif()
 ################################################################################
+# Optimizer opt-outs for pathological translation units
+################################################################################
+# These build one enormous brace initializer each, expanded from X-macros over the randomizer
+# enums (RandomizerInf.h alone is ~2900 entries), into nested containers of std::string. MSVC's
+# optimizer needs gigabytes to fold and inline that, and with /MP compiling many such files at
+# once it exhausts its heap: "error C1060: compiler is out of heap space". These are cold code —
+# a debug save editor, static enum-name tables, option declarations — so nothing here is worth
+# optimizing. /Od comes after the /O2 below and wins (MSVC takes the last optimization flag).
+if(MSVC)
+    set_source_files_properties(
+        soh/Enhancements/debugger/debugSaveEditor.cpp
+        soh/Enhancements/randomizer/randomizerEnumStrings.cpp
+        soh/Enhancements/randomizer/option.cpp
+        PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Release>:/Od>"
+    )
+endif()
+
+################################################################################
 # Compile and link options
 ################################################################################
 if(MSVC)
@@ -416,6 +434,11 @@ if(MSVC)
                 /Od
             >
             $<$<CONFIG:Release>:
+                # CMAKE_CXX_FLAGS_RELEASE is cleared above for MSVC, so this list is the ONLY
+                # source of optimization flags. Without /O2 the whole soh target (game logic and
+                # frame_interpolation, which runs once per rendered sub-frame) built at /Od even
+                # in Release. The Win32 branch below has always passed /O2; this was an omission.
+                /O2;
                 /Oi;
                 /Gy;
             >
