@@ -10,6 +10,7 @@
 #include <libultraship/bridge/windowbridge.h>
 #include "soh/Enhancements/gameconsole.h"
 #include "soh/OTRGlobals.h"
+#include <vr_interface.h>
 
 #define GFXPOOL_HEAD_MAGIC 0x1234
 #define GFXPOOL_TAIL_MAGIC 0x5678
@@ -310,7 +311,22 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
 
     gSPBranchList(WORK_DISP++, gfxCtx->polyOpaBuffer);
     gSPBranchList(POLY_OPA_DISP++, gfxCtx->polyXluBuffer);
-    gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);
+    // SOH [VR] Route the overlay display list (HUD, menus, text) to the head-locked VR quad layer
+    // instead of compositing it into the 3D scene; also flag 2D contexts — no PlayState (file
+    // select, title, opening) or the pause menu — so they render on the world-locked floating panel
+    // and head tracking stays alive while the game is frozen.
+    if (VR_IsInitialized()) {
+        gDPPipeSync(POLY_XLU_DISP++);
+        gDPFullSync(POLY_XLU_DISP++);
+        gSPEndDisplayList(POLY_XLU_DISP++);
+        VR_SetOverlayDisplayList(gfxCtx->overlayBuffer);
+        {
+            extern PlayState* gPlayState;
+            VR_SetFlatScreen((gPlayState == NULL) || (gPlayState->pauseCtx.state != 0));
+        }
+    } else {
+        gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);
+    }
     gDPPipeSync(OVERLAY_DISP++);
     gDPFullSync(OVERLAY_DISP++);
     gSPEndDisplayList(OVERLAY_DISP++);

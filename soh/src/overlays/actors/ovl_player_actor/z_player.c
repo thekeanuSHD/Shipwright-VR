@@ -6,6 +6,7 @@
 
 #include <libultraship/libultra.h>
 #include "global.h"
+#include <vr_interface.h>
 
 #include "overlays/actors/ovl_Bg_Heavy_Block/z_bg_heavy_block.h"
 #include "overlays/actors/ovl_Door_Shutter/z_door_shutter.h"
@@ -2038,6 +2039,15 @@ void Player_AnimReplaceNormalPlayLoopAdjusted(PlayState* play, Player* this, Lin
     Player_AnimReplacePlayLoopAdjusted(play, this, anim, 0x1C);
 }
 
+// SOH [VR] Returns the yaw that control-stick input is interpreted relative to. In VR first-person
+// this is the HMD heading (so movement is head-relative); otherwise the active camera's yaw as normal.
+static s16 Player_GetSteeringYaw(PlayState* play) {
+    if (VR_IsInitialized() && VR_GetFirstPerson()) {
+        return VR_GetHeadingYaw();
+    }
+    return Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+}
+
 void Player_ProcessControlStick(PlayState* play, Player* this) {
     s8 spinAngle;
     s8 direction;
@@ -2047,7 +2057,7 @@ void Player_ProcessControlStick(PlayState* play, Player* this) {
 
     func_80077D10(&sControlStickMagnitude, &sControlStickAngle, sControlInput);
 
-    sControlStickWorldYaw = Camera_GetInputDirYaw(GET_ACTIVE_CAM(play)) + sControlStickAngle;
+    sControlStickWorldYaw = Player_GetSteeringYaw(play) + sControlStickAngle;
 
     this->controlStickDataIndex = (this->controlStickDataIndex + 1) % 4;
 
@@ -4033,7 +4043,7 @@ s32 Player_GetMovementSpeedAndYaw(Player* this, f32* outSpeedTarget, s16* outYaw
 
         return false;
     } else {
-        *outYawTarget += Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        *outYawTarget += Player_GetSteeringYaw(play);
         return true;
     }
 }
@@ -11943,6 +11953,57 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
             }
 
             Actor_UpdatePos(&this->actor);
+
+            // #region SOH [VR] Roomscale 6DOF — physical headset translation moves Link's BODY, swept
+            // against walls by the engine's own sphere-vs-wall check. We move only as far as the body
+            // actually fits (the "achieved" amount) and report that back, so the camera anchor
+            // (bodyHead - achieved) keeps the eye continuous; anything the body can't reach stays as a
+            // head-lean ("head leans, body holds"). Gated to grounded + free locomotion. Rendering is
+            // untouched — this only changes Link's position.
+            if (VR_IsInitialized() && VR_GetFirstPerson() && CVarGetInteger("gVrRoomscale", 1) &&
+                (this->actor.bgCheckFlags & BGCHECKFLAG_GROUND) && !Player_InBlockingCsMode(play, this) &&
+                !(this->stateFlags1 &
+                  (PLAYER_STATE1_TALKING | PLAYER_STATE1_HANGING_OFF_LEDGE | PLAYER_STATE1_CLIMBING_LEDGE |
+                   PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_JUMPING |
+                   PLAYER_STATE1_FREEFALL)) &&
+                !(this->stateFlags2 & PLAYER_STATE2_DIVING)) {
+                float rsDesired[2];
+                VR_GetRoomscaleDesired(rsDesired);
+                float rsScale = CVarGetFloat("gVrRoomscaleScale", 1.0f);
+                float rsDx = rsDesired[0] * rsScale;
+                float rsDz = rsDesired[1] * rsScale;
+                float rsMag = sqrtf((rsDx * rsDx) + (rsDz * rsDz));
+                // Small deadzone: ignore sub-unit HMD jitter so Link's body doesn't micro-jitter (the
+                // camera still tracks head jitter; only the body is held still below the threshold).
+                if (rsMag > 0.1f) {
+                    // Rate-limit the per-frame catch-up so a large residual (e.g. after re-enabling)
+                    // glides in smoothly instead of lurching. Normal walking stays well under the cap.
+                    float rsCatchup = CVarGetFloat("gVrRoomscaleCatchup", 12.0f);
+                    if (rsMag > rsCatchup) {
+                        float k = rsCatchup / rsMag;
+                        rsDx *= k;
+                        rsDz *= k;
+                    }
+                    Vec3f rsFrom = this->actor.world.pos;
+                    Vec3f rsTo = rsFrom;
+                    rsTo.x += rsDx;
+                    rsTo.z += rsDz;
+                    Vec3f rsResult = rsTo;
+                    CollisionPoly* rsPoly;
+                    s32 rsBgId;
+                    // Same sphere-vs-wall sweep the player's own collision uses (radius/height match
+                    // Player_ProcessSceneCollision), so roomscale is blocked by walls exactly as walking is.
+                    BgCheck_EntitySphVsWall3(&play->colCtx, &rsResult, &rsTo, &rsFrom,
+                                             this->ageProperties->wallCheckRadius, &rsPoly, &rsBgId, &this->actor,
+                                             26.0f);
+                    this->actor.world.pos.x = rsResult.x;
+                    this->actor.world.pos.z = rsResult.z;
+                    // Advance the baked-in origin by what the body ACTUALLY moved (collision-limited).
+                    VR_AddRoomscaleDisplacement(rsResult.x - rsFrom.x, rsResult.z - rsFrom.z);
+                }
+            }
+            // #endregion
+
             Player_ProcessSceneCollision(play, this);
         } else {
             if (GameInteractor_Should(VB_SET_STATIC_FLOOR_TYPE, true, this)) {
@@ -12481,7 +12542,11 @@ void Player_Draw(Actor* thisx, PlayState* play2) {
         func_8002EBCC(&this->actor, play, 0);
         func_8002ED80(&this->actor, play, 0);
 
-        if (this->unk_6AD != 0) {
+        if (VR_IsInitialized() && VR_GetFirstPerson()) {
+            // SOH [VR] The camera sits at Link's head, so draw the full body but cull the head +
+            // hat (the game's projected-Z test uses the third-person matrix and doesn't apply).
+            overrideLimbDraw = Player_OverrideLimbDrawGameplayVRFirstPerson;
+        } else if (this->unk_6AD != 0) {
             Vec3f projectedHeadPos;
 
             SkinMatrix_Vec3fMtxFMultXYZ(&play->viewProjectionMtxF, &this->actor.focus.pos, &projectedHeadPos);

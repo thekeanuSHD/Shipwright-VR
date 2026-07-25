@@ -40,6 +40,7 @@ class SohMenu : public Ship::Menu {
     WidgetInfo& AddWidget(WidgetPath& pathInfo, std::string widgetName, WidgetType widgetType);
     void AddMenuElements();
     void AddMenuSettings();
+    void AddMenuVRSettings();
     void AddMenuEnhancements();
     void AddMenuDevTools();
     void AddMenuRandomizer();
