@@ -26,6 +26,162 @@ static const std::map<int32_t, const char*> vrHudAttachOptions = {
     { 2, "Right Hand" },
 };
 
+// --- VR Inputs: N64-button-first binding editor (styled after the base game's bindings window:
+// colored N64 chip per row, removable chips for each bound VR input, "+" to add). All state lives
+// in the gVrBind* mask CVars that padmgr.c reads.
+struct VrInputDef {
+    const char* label;
+    const char* cvar;
+    int32_t defaultMask;
+};
+static const VrInputDef sVrInputDefs[] = {
+    { "L Trigger", "gVrBindLTrigger", BTN_Z },      { "L Grip", "gVrBindLGrip", BTN_R },
+    { "X", "gVrBindLPrimary", BTN_CLEFT },          { "Y", "gVrBindLSecondary", BTN_CRIGHT },
+    { "L Stick", "gVrBindLStickClick", 0 },         { "L Menu", "gVrBindLMenu", BTN_START },
+    { "R Trigger", "gVrBindRTrigger", BTN_B },      { "R Grip", "gVrBindRGrip", 0 },
+    { "A", "gVrBindRPrimary", BTN_A },              { "B", "gVrBindRSecondary", BTN_CDOWN },
+    { "R Stick", "gVrBindRStickClick", 0 },         { "R Menu", "gVrBindRMenu", 0 },
+};
+
+struct VrN64RowDef {
+    const char* label;
+    uint16_t mask;
+    ImVec4 color;
+};
+
+// Which N64 button row is currently listening for a physical VR press (0 = none), and the
+// previous frame's controller state per hand for rising-edge detection (so a button already held
+// when listening starts doesn't instantly bind).
+static uint16_t sVrListenRowMask = 0;
+static uint16_t sVrListenPrevBtn[2] = { 0, 0 };
+
+static void VrInputBindingRow(const VrN64RowDef& row) {
+    ImGui::PushID(row.label);
+
+    // The N64 button chip (colored, inert — it's a label).
+    ImGui::PushStyleColor(ImGuiCol_Button, row.color);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, row.color);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, row.color);
+    ImGui::Button(row.label, ImVec2(76.0f, 0.0f));
+    ImGui::PopStyleColor(3);
+
+    // One removable chip per VR input currently bound to this button.
+    for (const VrInputDef& input : sVrInputDefs) {
+        int32_t cur = CVarGetInteger(input.cvar, input.defaultMask);
+        if (cur & row.mask) {
+            ImGui::SameLine();
+            ImGui::PushID(input.cvar);
+            char chip[48];
+            snprintf(chip, sizeof(chip), "%s %s x", ICON_FA_GAMEPAD, input.label);
+            if (ImGui::SmallButton(chip)) {
+                CVarSetInteger(input.cvar, cur & ~row.mask);
+                CVarSave();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Remove this binding");
+            }
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::SameLine();
+    const bool listening = (sVrListenRowMask == row.mask);
+    if (listening) {
+        // Listening: press any input on either VR controller to bind it to this row.
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.48f, 0.78f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.55f, 0.88f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.30f, 0.55f, 1.0f));
+        if (ImGui::SmallButton("Press a VR input... (click or Esc to cancel)")) {
+            sVrListenRowMask = 0;
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            sVrListenRowMask = 0;
+        }
+        static const uint16_t sVrBtnBits[6] = { VR_BTN_TRIGGER,   VR_BTN_GRIP,       VR_BTN_PRIMARY,
+                                                VR_BTN_SECONDARY, VR_BTN_THUMBCLICK, VR_BTN_MENU };
+        for (int hand = 0; hand < 2 && sVrListenRowMask != 0; hand++) {
+            uint16_t curBtn = VR_GetControllerButton(hand);
+            uint16_t pressed = curBtn & ~sVrListenPrevBtn[hand];
+            sVrListenPrevBtn[hand] = curBtn;
+            for (int b = 0; b < 6; b++) {
+                if (pressed & sVrBtnBits[b]) {
+                    const VrInputDef& input = sVrInputDefs[hand * 6 + b];
+                    CVarSetInteger(input.cvar, CVarGetInteger(input.cvar, input.defaultMask) | row.mask);
+                    CVarSave();
+                    sVrListenRowMask = 0;
+                    break;
+                }
+            }
+        }
+    } else {
+        // Blue "+": in VR, listen for a physical press; outside VR, fall back to a picker list.
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.65f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.48f, 0.78f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.30f, 0.55f, 1.0f));
+        if (ImGui::SmallButton("+")) {
+            if (VR_IsInitialized()) {
+                sVrListenRowMask = row.mask;
+                sVrListenPrevBtn[0] = VR_GetControllerButton(0);
+                sVrListenPrevBtn[1] = VR_GetControllerButton(1);
+            } else {
+                ImGui::OpenPopup("VrAddBinding");
+            }
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(VR_IsInitialized() ? "Then press the VR controller input to bind"
+                                                 : "Pick a VR input to bind (VR not active)");
+        }
+        if (ImGui::BeginPopup("VrAddBinding")) {
+            for (const VrInputDef& input : sVrInputDefs) {
+                int32_t cur = CVarGetInteger(input.cvar, input.defaultMask);
+                if (!(cur & row.mask)) {
+                    if (ImGui::MenuItem(input.label)) {
+                        CVarSetInteger(input.cvar, cur | row.mask);
+                        CVarSave();
+                    }
+                }
+            }
+            ImGui::EndPopup();
+        }
+    }
+
+    ImGui::PopID();
+}
+
+static void VrInputBindings(WidgetInfo& info) {
+    static const VrN64RowDef sButtonRows[] = {
+        { "A", BTN_A, ImVec4(0.22f, 0.24f, 0.50f, 1.0f) },
+        { "B", BTN_B, ImVec4(0.12f, 0.35f, 0.14f, 1.0f) },
+        { "Start", BTN_START, ImVec4(0.48f, 0.14f, 0.14f, 1.0f) },
+        { "L", BTN_L, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "R", BTN_R, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "Z", BTN_Z, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "C " ICON_FA_ARROW_UP, BTN_CUP, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "C " ICON_FA_ARROW_DOWN, BTN_CDOWN, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "C " ICON_FA_ARROW_LEFT, BTN_CLEFT, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "C " ICON_FA_ARROW_RIGHT, BTN_CRIGHT, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+    };
+    static const VrN64RowDef sDpadRows[] = {
+        { "D " ICON_FA_ARROW_UP, BTN_DUP, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "D " ICON_FA_ARROW_DOWN, BTN_DDOWN, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "D " ICON_FA_ARROW_LEFT, BTN_DLEFT, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "D " ICON_FA_ARROW_RIGHT, BTN_DRIGHT, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+    };
+
+    if (ImGui::CollapsingHeader("Buttons##VrInputs", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (const VrN64RowDef& row : sButtonRows) {
+            VrInputBindingRow(row);
+        }
+    }
+    if (ImGui::CollapsingHeader("D-Pad##VrInputs", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (const VrN64RowDef& row : sDpadRows) {
+            VrInputBindingRow(row);
+        }
+    }
+}
+
 // Live frame-cost breakdown. The interesting number is "XR wait": that is time spent blocked in
 // xrWaitFrame, i.e. spare headroom. When it trends toward zero the frame no longer fits and the
 // compositor starts reprojecting.
@@ -52,12 +208,6 @@ static void VrPerformanceReadout(WidgetInfo& info) {
                            "same thread, so it comes out of the render budget)");
 }
 
-// Must match the value encoding read by padmgr.c's VR button mapping.
-static const std::map<int32_t, const char*> vrN64ButtonOptions = {
-    { 0, "None" },     { 1, "A" },        { 2, "B (Sword)" }, { 3, "Z (Target)" },
-    { 4, "R (Shield)" }, { 5, "L" },      { 6, "Start (Pause)" }, { 7, "C-Up" },
-    { 8, "C-Down" },   { 9, "C-Left" },   { 10, "C-Right" },
-};
 
 void SohMenu::AddMenuVRSettings() {
     AddMenuEntry("VR Settings", CVAR_SETTING("Menu.VRSettingsSidebarSection"));
@@ -98,6 +248,33 @@ void SohMenu::AddMenuVRSettings() {
                               "(no snap turn; the game owns all camera movement). The camera's "
                               "up/down tilt is not applied - the horizon stays level with the real "
                               "world and you tilt your own head instead. Switch any time."));
+    AddWidget(movementPath, "Auto Director Camera When Far From Link", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrFpAutoDirectorCam")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrEnabled", 1) || !CVarGetInteger("gVrFirstPerson", 1);
+        })
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Cutscenes stay first-person (you experience them from Link's eyes) - but when the "
+            "game's camera goes far away from Link (a cutscene showing a distant place, or a "
+            "scene still loading), first person would leave you staring at nothing, so the view "
+            "automatically rides the game's camera until it comes back to Link. Disable to stay "
+            "strictly in Link's head no matter what."));
+
+    AddWidget(movementPath, "Locomotion", WIDGET_SEPARATOR_TEXT);
+    AddWidget(movementPath, "Body Follows Head (VR Movement)", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrBodyFollowsHead")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrEnabled", 1) || !CVarGetInteger("gVrFirstPerson", 1);
+        })
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Standard VR locomotion: Link's body always faces where you're looking, and on the "
+            "ground your velocity IS the stick - exact direction, speed proportional to "
+            "deflection, applied the same frame. Push a little to creep, release to stop dead; no "
+            "acceleration ramp, no start-step or turn-around animations gating movement (motion-"
+            "sickness comfort: what your hand does is exactly what your body feels). Rolls, "
+            "jumps, attacks and knockbacks keep their normal motion, and the game still "
+            "choreographs Link in cutscenes, on Epona and while climbing. Off = classic OoT "
+            "movement."));
 
     AddWidget(movementPath, "Turning", WIDGET_SEPARATOR_TEXT);
     AddWidget(movementPath, "Snap Turning (Right Stick)", WIDGET_CVAR_CHECKBOX)
@@ -186,53 +363,14 @@ void SohMenu::AddMenuVRSettings() {
                        "second pacer running off the monitor's refresh rate would fight it.",
               WIDGET_TEXT);
 
-    AddSidebarEntry("VR Settings", "Buttons", 2);
-    WidgetPath buttonsPath = { "VR Settings", "Buttons", SECTION_COLUMN_1 };
+    AddSidebarEntry("VR Settings", "VR Inputs", 1);
+    WidgetPath buttonsPath = { "VR Settings", "VR Inputs", SECTION_COLUMN_1 };
 
-    AddWidget(buttonsPath, "Left Controller", WIDGET_SEPARATOR_TEXT);
-    AddWidget(buttonsPath, "Left Trigger", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnLTrigger")
-        .Options(ComboboxOptions().DefaultIndex(3).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Left Grip", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnLGrip")
-        .Options(ComboboxOptions().DefaultIndex(4).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "X Button", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnLPrimary")
-        .Options(ComboboxOptions().DefaultIndex(9).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Y Button", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnLSecondary")
-        .Options(ComboboxOptions().DefaultIndex(10).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Left Stick Click", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnLStickClick")
-        .Options(ComboboxOptions().DefaultIndex(0).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Left Menu Button", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnLMenu")
-        .Options(ComboboxOptions()
-                     .DefaultIndex(6)
-                     .ComboMap(vrN64ButtonOptions)
-                     .Tooltip("Make sure SOMETHING maps to Start, or you won't be able to pause."));
-
-    buttonsPath.column = SECTION_COLUMN_2;
-    AddWidget(buttonsPath, "Right Controller", WIDGET_SEPARATOR_TEXT);
-    AddWidget(buttonsPath, "Right Trigger", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnRTrigger")
-        .Options(ComboboxOptions().DefaultIndex(2).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Right Grip", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnRGrip")
-        .Options(ComboboxOptions().DefaultIndex(0).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "A Button", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnRPrimary")
-        .Options(ComboboxOptions().DefaultIndex(1).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "B Button", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnRSecondary")
-        .Options(ComboboxOptions().DefaultIndex(8).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Right Stick Click", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnRStickClick")
-        .Options(ComboboxOptions().DefaultIndex(0).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Right Menu Button", WIDGET_CVAR_COMBOBOX)
-        .CVar("gVrBtnRMenu")
-        .Options(ComboboxOptions().DefaultIndex(0).ComboMap(vrN64ButtonOptions));
-    AddWidget(buttonsPath, "Sticks are fixed: left = movement, right = C-buttons/snap turn.", WIDGET_TEXT);
+    AddWidget(buttonsPath, "VrInputBindings", WIDGET_CUSTOM).CustomFunction(VrInputBindings).HideInSearch(true);
+    AddWidget(buttonsPath, "Click a chip to remove a binding, + to add one. A VR input may press "
+                           "several buttons at once. Sticks are fixed: left = movement, right = "
+                           "C-buttons/snap turn.",
+              WIDGET_TEXT);
 
     AddSidebarEntry("VR Settings", "Camera", 1);
     WidgetPath cameraPath = { "VR Settings", "Camera", SECTION_COLUMN_1 };
@@ -269,8 +407,18 @@ void SohMenu::AddMenuVRSettings() {
                      .Format("%.1f")
                      .Tooltip("Move the eye anchor sideways relative to Link's facing (game units)."));
     AddWidget(cameraPath, "World Scale", WIDGET_SEPARATOR_TEXT);
+    AddWidget(cameraPath, "Match Scale To My Height (Be Link-Sized)", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrAutoWorldScale")
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Derive world scale from your real standing eye height so you are exactly Link-sized: "
+            "the ground meets your physical floor and age swaps rescale automatically. "
+            "Re-measured when you recenter or re-enter first person - stand normally when you do. "
+            "Disable to use the fixed World Scale slider instead (one true world size regardless "
+            "of who is playing). Needs a runtime with floor calibration; without one the slider "
+            "applies either way."));
     AddWidget(cameraPath, "World Scale: %.1f units/m", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrWorldScale")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = CVarGetInteger("gVrAutoWorldScale", 1); })
         .Options(FloatSliderOptions()
                      .Min(10.0f)
                      .Max(100.0f)
@@ -361,6 +509,17 @@ void SohMenu::AddMenuVRSettings() {
                      .Format("%.0f")
                      .Tooltip("Tilt about the grip so the panel faces your eyes at a natural "
                               "wrist-watch angle."));
+    AddWidget(cameraPath, "Lock-On Reticle Size: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrReticleScale")
+        .Options(FloatSliderOptions()
+                     .Min(0.3f)
+                     .Max(3.0f)
+                     .DefaultValue(1.0f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("Size of the in-world Z-target reticle (the converging triangles "
+                              "that wrap whatever you lock onto). In VR the reticle is drawn in "
+                              "the 3D scene at the target, not on the flat HUD."));
     AddWidget(cameraPath, "Show Letterbox Bars", WIDGET_CVAR_CHECKBOX)
         .CVar("gVrLetterbox")
         .Options(CheckboxOptions().Tooltip(
@@ -412,6 +571,80 @@ void SohMenu::AddMenuVRSettings() {
         .Options(CheckboxOptions()
                      .DefaultValue(true)
                      .Tooltip("Detach Link's hands from his body and pin them to the VR controllers."));
+    AddWidget(path, "Hide Link's Body", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrHideBody")
+        .Options(CheckboxOptions().Tooltip(
+            "First person only: don't draw Link's body - just the floating hands and whatever "
+            "they hold (the classic VR style). Some players prefer it because the body can block "
+            "the view when looking down, and its animations don't always match what you're "
+            "doing. Third person and cutscenes always show the full body."));
+    AddWidget(path, "Motion Weapon Aim", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrWeaponAim")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrMotionHands", 1); })
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Slingshot seeds, arrows and the hookshot launch from your weapon hand and fly where "
+            "that controller points (its aim ray - the same ray runtimes use for menu pointing). "
+            "The weapon rides the hand holding the bow/slingshot model. Even while Z-targeted, "
+            "your hand decides the shot; lock-on only steers the camera. Off = the stock "
+            "stick-aiming behavior."));
+    AddWidget(path, "Aim Pitch: %.1f deg", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrAimCalPitch")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrMotionHands", 1) || !CVarGetInteger("gVrWeaponAim", 1);
+        })
+        .Options(FloatSliderOptions()
+                     .Min(-45.0f)
+                     .Max(45.0f)
+                     .DefaultValue(0.0f)
+                     .Step(0.5f)
+                     .Format("%.1f")
+                     .Tooltip("Tilt the aim ray up/down relative to the controller. If shots "
+                              "consistently land high or low of where you point, trim it here."));
+    AddWidget(path, "Aim Yaw: %.1f deg", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrAimCalYaw")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrMotionHands", 1) || !CVarGetInteger("gVrWeaponAim", 1);
+        })
+        .Options(FloatSliderOptions()
+                     .Min(-45.0f)
+                     .Max(45.0f)
+                     .DefaultValue(0.0f)
+                     .Step(0.5f)
+                     .Format("%.1f")
+                     .Tooltip("Skew the aim ray left/right relative to the controller."));
+    AddWidget(path, "Aim Origin Right: %.2f m", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrAimOffX")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrMotionHands", 1) || !CVarGetInteger("gVrWeaponAim", 1);
+        })
+        .Options(FloatSliderOptions()
+                     .Min(-0.3f)
+                     .Max(0.3f)
+                     .DefaultValue(0.0f)
+                     .Step(0.01f)
+                     .Format("%.2f")
+                     .Tooltip("Slide the projectile's launch point sideways along the aim frame "
+                              "(meters), e.g. to sit in the slingshot pouch."));
+    AddWidget(path, "Aim Origin Up: %.2f m", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrAimOffY")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrMotionHands", 1) || !CVarGetInteger("gVrWeaponAim", 1);
+        })
+        .Options(FloatSliderOptions().Min(-0.3f).Max(0.3f).DefaultValue(0.0f).Step(0.01f).Format("%.2f"));
+    AddWidget(path, "Aim Origin Forward: %.2f m", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrAimOffZ")
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger("gVrMotionHands", 1) || !CVarGetInteger("gVrWeaponAim", 1);
+        })
+        .Options(FloatSliderOptions()
+                     .Min(-0.3f)
+                     .Max(0.3f)
+                     .DefaultValue(0.0f)
+                     .Step(0.01f)
+                     .Format("%.2f")
+                     .Tooltip("Push the launch point forward along the ray (negative = toward "
+                              "you). Note OpenXR aim forward is -Z, so forward here is negative Z "
+                              "in the raw frame - this slider already accounts for that."));
     AddWidget(path, "Left-Handed Mode", WIDGET_CVAR_CHECKBOX)
         .CVar("gVrLeftHanded")
         .Options(CheckboxOptions().Tooltip(
@@ -552,6 +785,11 @@ void SohMenu::AddMenuVRSettings() {
                      "gVrHandOffX=%.1f\n"
                      "gVrHandOffY=%.1f\n"
                      "gVrHandOffZ=%.1f\n"
+                     "gVrAimCalPitch=%.1f\n"
+                     "gVrAimCalYaw=%.1f\n"
+                     "gVrAimOffX=%.2f\n"
+                     "gVrAimOffY=%.2f\n"
+                     "gVrAimOffZ=%.2f\n"
                      "gVrHandLOverride=%d\n"
                      "gVrHandLCalPitch=%.1f\n"
                      "gVrHandLCalYaw=%.1f\n"
@@ -565,6 +803,9 @@ void SohMenu::AddMenuVRSettings() {
                      CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
                      CVarGetFloat("gVrHandCalRoll", 80.0f), CVarGetFloat("gVrHandOffX", 0.0f),
                      CVarGetFloat("gVrHandOffY", 0.0f), CVarGetFloat("gVrHandOffZ", 0.0f),
+                     CVarGetFloat("gVrAimCalPitch", 0.0f), CVarGetFloat("gVrAimCalYaw", 0.0f),
+                     CVarGetFloat("gVrAimOffX", 0.0f), CVarGetFloat("gVrAimOffY", 0.0f),
+                     CVarGetFloat("gVrAimOffZ", 0.0f),
                      CVarGetInteger("gVrHandLOverride", 1), CVarGetFloat("gVrHandLCalPitch", -149.0f),
                      CVarGetFloat("gVrHandLCalYaw", 76.0f), CVarGetFloat("gVrHandLCalRoll", 30.0f),
                      CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 0.0f),

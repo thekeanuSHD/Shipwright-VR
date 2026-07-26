@@ -320,18 +320,24 @@ void Graph_Update(GraphicsContext* gfxCtx, GameState* gameState) {
 
     gSPBranchList(WORK_DISP++, gfxCtx->polyOpaBuffer);
     gSPBranchList(POLY_OPA_DISP++, gfxCtx->polyXluBuffer);
-    // SOH [VR] Route the overlay display list (HUD, menus, text) to the head-locked VR quad layer
-    // instead of compositing it into the 3D scene; also flag 2D contexts — no PlayState (file
-    // select, title, opening) or the pause menu — so they render on the world-locked floating panel
-    // and head tracking stays alive while the game is frozen.
+    // SOH [VR] Overlay routing. During gameplay the overlay display list (HUD, text) renders on
+    // the VR HUD quad (head-locked or hand-attached). In FLAT-SCREEN contexts — no PlayState
+    // (file select, title) or the pause menu — the overlay carries the whole 2D interface (kaleido
+    // inventory pages AND the pause background-capture command), which must render into the
+    // floating panel as one image, NOT onto the HUD quad: with the HUD pinned to a hand, the
+    // inventory would end up on the player's wrist while the panel stays black.
     if (VR_IsInitialized()) {
-        gDPPipeSync(POLY_XLU_DISP++);
-        gDPFullSync(POLY_XLU_DISP++);
-        gSPEndDisplayList(POLY_XLU_DISP++);
-        VR_SetOverlayDisplayList(gfxCtx->overlayBuffer);
-        {
-            extern PlayState* gPlayState;
-            VR_SetFlatScreen((gPlayState == NULL) || (gPlayState->pauseCtx.state != 0));
+        extern PlayState* gPlayState;
+        s32 vrFlatScreen = (gPlayState == NULL) || (gPlayState->pauseCtx.state != 0);
+        VR_SetFlatScreen(vrFlatScreen);
+        if (vrFlatScreen) {
+            gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);
+            VR_SetOverlayDisplayList(NULL);
+        } else {
+            gDPPipeSync(POLY_XLU_DISP++);
+            gDPFullSync(POLY_XLU_DISP++);
+            gSPEndDisplayList(POLY_XLU_DISP++);
+            VR_SetOverlayDisplayList(gfxCtx->overlayBuffer);
         }
     } else {
         gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);

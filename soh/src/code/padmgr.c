@@ -328,24 +328,21 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
         uint16_t vrL = VR_GetControllerButton(VR_HAND_LEFT);
         uint16_t vrR = VR_GetControllerButton(VR_HAND_RIGHT);
 
-        // Assignable VR button -> N64 button mapping, configured in VR Settings -> Buttons.
-        // CVar value: 0=None 1=A 2=B 3=Z 4=R 5=L 6=Start 7=C-Up 8=C-Down 9=C-Left 10=C-Right
+        // Assignable VR input -> N64 button mapping, configured in VR Settings -> VR Inputs. Each
+        // CVar holds an N64 BUTTON BITMASK (same encoding as the base game's button-combination
+        // selector), so one controller input may press a single button or a whole combination.
         {
-            static const u16 sVrN64Buttons[] = {
-                0,     BTN_A,   BTN_B,     BTN_Z,    BTN_R,     BTN_L,
-                BTN_START, BTN_CUP, BTN_CDOWN, BTN_CLEFT, BTN_CRIGHT,
-            };
-            static const char* sVrBtnCvars[2][6] = {
-                { "gVrBtnLTrigger", "gVrBtnLGrip", "gVrBtnLPrimary", "gVrBtnLSecondary", "gVrBtnLStickClick",
-                  "gVrBtnLMenu" },
-                { "gVrBtnRTrigger", "gVrBtnRGrip", "gVrBtnRPrimary", "gVrBtnRSecondary", "gVrBtnRStickClick",
-                  "gVrBtnRMenu" },
+            static const char* sVrBindCvars[2][6] = {
+                { "gVrBindLTrigger", "gVrBindLGrip", "gVrBindLPrimary", "gVrBindLSecondary", "gVrBindLStickClick",
+                  "gVrBindLMenu" },
+                { "gVrBindRTrigger", "gVrBindRGrip", "gVrBindRPrimary", "gVrBindRSecondary", "gVrBindRStickClick",
+                  "gVrBindRMenu" },
             };
             // Defaults: left = Z-target, R-shield, C-left, C-right, none, Start;
             //           right = B-sword, none, A, C-down, none, none.
-            static const s32 sVrBtnDefaults[2][6] = {
-                { 3, 4, 9, 10, 0, 6 },
-                { 2, 0, 1, 8, 0, 0 },
+            static const s32 sVrBindDefaults[2][6] = {
+                { BTN_Z, BTN_R, BTN_CLEFT, BTN_CRIGHT, 0, BTN_START },
+                { BTN_B, 0, BTN_A, BTN_CDOWN, 0, 0 },
             };
             static const u16 sVrBtnMasks[6] = { VR_BTN_TRIGGER,   VR_BTN_GRIP,       VR_BTN_PRIMARY,
                                                 VR_BTN_SECONDARY, VR_BTN_THUMBCLICK, VR_BTN_MENU };
@@ -354,11 +351,10 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
                 uint16_t vrState = (vrHandIdx == 0) ? vrL : vrR;
                 for (vrBtnIdx = 0; vrBtnIdx < 6; vrBtnIdx++) {
                     if (vrState & sVrBtnMasks[vrBtnIdx]) {
-                        s32 mapped = CVarGetInteger(sVrBtnCvars[vrHandIdx][vrBtnIdx],
-                                                    sVrBtnDefaults[vrHandIdx][vrBtnIdx]);
-                        if (mapped > 0 && mapped <= 10) {
-                            vrPad->button |= sVrN64Buttons[mapped];
-                        }
+                        s32 mapped = CVarGetInteger(sVrBindCvars[vrHandIdx][vrBtnIdx],
+                                                    sVrBindDefaults[vrHandIdx][vrBtnIdx]);
+                        // Mask to the real pad bits (drops the PC-only modifier bits if selected).
+                        vrPad->button |= (u16)(mapped & 0xFFFF);
                     }
                 }
             }

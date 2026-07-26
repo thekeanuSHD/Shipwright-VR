@@ -1356,10 +1356,38 @@ void Play_Draw(PlayState* play) {
     // #region SOH [VR] First-person camera anchor — push Link's head position to the VR layer.
     // The VR view is then composed as (head anchor + HMD offset/orientation); see vr_openxr.cpp.
     static bool sVrFirstPersonWasActive = false;
+    static bool sVrFarCamFallback = false;
     if (VR_IsInitialized()) {
         // Clear last frame's live hand-matrix tags; the player limb override re-registers this frame.
         VR_ClearHandMatrices();
-        if (CVarGetInteger("gVrFirstPerson", 1)) {
+
+        // First-person availability guard: when the active camera is far from Link — a cutscene
+        // framing a distant location, or Link not yet positioned during a scene load — Link's eyes
+        // are by definition not where the game wants you looking, so ride the director's camera
+        // (the third-person frame) until the camera returns to him. Hysteresis (fall out beyond
+        // the threshold, return under 60% of it) prevents flicker at the boundary; the anchor's
+        // own snap-on-large-jump logic makes both transitions a clean cut.
+        if (CVarGetInteger("gVrFirstPerson", 1) && CVarGetInteger("gVrFpAutoDirectorCam", 1)) {
+            Player* vrGuardPlayer = GET_PLAYER(play);
+            Camera* vrGuardCam = GET_ACTIVE_CAM(play);
+            f32 vrCamDx = vrGuardCam->eye.x - vrGuardPlayer->actor.world.pos.x;
+            f32 vrCamDy = vrGuardCam->eye.y - vrGuardPlayer->actor.world.pos.y;
+            f32 vrCamDz = vrGuardCam->eye.z - vrGuardPlayer->actor.world.pos.z;
+            f32 vrCamDistSq = SQ(vrCamDx) + SQ(vrCamDy) + SQ(vrCamDz);
+            f32 vrFarDist = CVarGetFloat("gVrFpFallbackDist", 1200.0f);
+            f32 vrNearDist = vrFarDist * 0.6f;
+            if (sVrFarCamFallback) {
+                if (vrCamDistSq < SQ(vrNearDist)) {
+                    sVrFarCamFallback = false;
+                }
+            } else if (vrCamDistSq > SQ(vrFarDist)) {
+                sVrFarCamFallback = true;
+            }
+        } else {
+            sVrFarCamFallback = false;
+        }
+
+        if (CVarGetInteger("gVrFirstPerson", 1) && !sVrFarCamFallback) {
             Player* vrPlayer = GET_PLAYER(play);
             // Anchor to the actor ROOT (smooth, no walk-cycle bob) plus eye height, instead of the
             // animated head bone (actor.focus.pos) which carries the up/down bob and sway. The body
@@ -1377,7 +1405,19 @@ void Play_Draw(PlayState* play) {
             sVrFirstPersonWasActive = true;
 
             Vec3f vrHead = vrPlayer->actor.world.pos;
-            vrHead.y += Player_GetHeight(vrPlayer) + CVarGetFloat("gVrHeadHeightOffset", -9.0f);
+            {
+                f32 vrEyeHeight = Player_GetHeight(vrPlayer);
+                // Auto world scale calibrates against the STANDING eye height (never the crawl-
+                // reduced one), so the game ground meets the real floor and child/adult swaps
+                // rescale automatically.
+                VR_SetLinkEyeHeight(vrEyeHeight + CVarGetFloat("gVrHeadHeightOffset", -9.0f));
+                // Crawlspaces: Link is prone, so the eye belongs just above the ground — standing
+                // height would float the camera into (or above) the tunnel ceiling.
+                if (vrPlayer->stateFlags2 & PLAYER_STATE2_CRAWLING) {
+                    vrEyeHeight *= 0.5f;
+                }
+                vrHead.y += vrEyeHeight + CVarGetFloat("gVrHeadHeightOffset", -9.0f);
+            }
             // Head position relative to Link's body, tunable from VR Settings. Forward/side follow
             // Link's facing. All offsets are GAME UNITS applied to the anchor, so they interact with
             // world scale the physically-correct way: a lower head really does bring the ground
@@ -1396,21 +1436,18 @@ void Play_Draw(PlayState* play) {
             // body slides under the head and the existing anchor interpolation stays smooth. The
             // origin is horizontal only (x,z); y stays the body head height.
             // Keep the camera within the SAME walls that stop Link's body, but ONLY for non-6DOF
-            // sources. The joystick only ever moves Link's (collision-bounded) body, so it can't carry
-            // the camera through a wall; the camera's extra reach is the physical head offset (the
-            // roomscale residual). We sphere-cast from Link's body to where the camera wants to sit
-            // (using Link's own wall radius) to find how much of that offset is past a wall, then EASE
-            // only a fraction of it back into Link's bounds each frame. Active physical head movement
-            // outruns the ease (a real 6DOF lean still pokes through); a static head offset or a
-            // joystick-driven approach has no motion, so it decays to Link's boundary within a few
-            // frames. gVrCameraWallEase: 1 = hard clamp (default — looking into a wall just pushes you
-            // back; not what most modern VR does, but a fair compromise for now), ~0.15 = gentle ease,
-            // 0 = off (camera passes walls freely). gVrCameraWallCollision 0 disables this entirely.
+            // sources. gVrCameraWallEase: 1 = hard clamp, ~0.15 = gentle ease, 0 = off.
+            // gVrCameraWallCollision 0 disables this entirely.
             if (CVarGetInteger("gVrCameraWallCollision", 1)) {
                 float vrResidual[2]; // the camera's current horizontal offset from Link's body
                 VR_GetRoomscaleDesired(vrResidual);
-                if ((vrResidual[0] != 0.0f) || (vrResidual[1] != 0.0f)) {
-                    f32 vrCamY = vrPlayer->actor.world.pos.y + Player_GetHeight(vrPlayer);
+                // Only meaningful for real physical leans: with the camera near Link (normal stick
+                // play) the joystick's own collision already bounds it. Sweep at the camera's
+                // ACTUAL eye height (vrHead.y — tuned offset + crawl reduction), not standing head
+                // height, so passing under low geometry (bridges) doesn't read as walled.
+                f32 vrResidualMagSq = SQ(vrResidual[0]) + SQ(vrResidual[1]);
+                if (vrResidualMagSq > SQ(8.0f)) {
+                    f32 vrCamY = vrHead.y;
                     Vec3f vrCamFrom = { vrPlayer->actor.world.pos.x, vrCamY, vrPlayer->actor.world.pos.z };
                     Vec3f vrCamTo = { vrCamFrom.x + vrResidual[0], vrCamY, vrCamFrom.z + vrResidual[1] };
                     Vec3f vrCamRes = vrCamTo;
@@ -1424,6 +1461,7 @@ void Play_Draw(PlayState* play) {
                                                 (vrCamTo.z - vrCamRes.z) * vrWallEase);
                 }
             }
+            VR_SetViewFade(0.0f);
             // Also bound the camera-to-body lean by distance, for places with no wall at head height
             // (ledges, railings) where it could otherwise drift far from Link (0 = unbounded).
             VR_ClampRoomscaleLean(CVarGetFloat("gVrRoomscaleMaxLean", 30.0f));

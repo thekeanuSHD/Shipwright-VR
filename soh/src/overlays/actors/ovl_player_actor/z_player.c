@@ -2043,9 +2043,33 @@ void Player_AnimReplaceNormalPlayLoopAdjusted(PlayState* play, Player* this, Lin
 // this is the HMD heading (so movement is head-relative); otherwise the active camera's yaw as normal.
 static s16 Player_GetSteeringYaw(PlayState* play) {
     if (VR_IsInitialized() && VR_GetFirstPerson()) {
+        Player* vrPlayer = GET_PLAYER(play);
+        // Crawlspaces: the stick must map to the TUNNEL axis (Link's body), not the head — you
+        // can only crawl forward or backward, and looking around inside the tunnel must not
+        // change which way "forward" is (it made the exit unreachable when the head was off-axis).
+        if (vrPlayer->stateFlags2 & PLAYER_STATE2_CRAWLING) {
+            return vrPlayer->actor.shape.rot.y;
+        }
         return VR_GetHeadingYaw();
     }
     return Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+}
+
+// SOH [VR] Direct-movement mode (standard VR locomotion): Link's body always faces the headset and
+// the stick is a movement VECTOR in that frame — exact direction, no turn easing, no pivot brake.
+// The action state machine stays authoritative for everything else.
+static s32 Player_VrDirectMovement(Player* this) {
+    return VR_IsInitialized() && VR_GetFirstPerson() && CVarGetInteger("gVrBodyFollowsHead", 1);
+}
+
+// SOH [VR] The neutral ground-locomotion actions (idle, walk, run, strafes, turn-around). ONLY in
+// these does the kinematic stick override drive velocity directly — rolls, attacks, jumps,
+// knockbacks and every other action keep their authored motion untouched.
+static s32 Player_VrIsNeutralLocomotion(Player* this) {
+    return (this->actionFunc == Player_Action_Idle) || (this->actionFunc == Player_Action_80840DE4) ||
+           (this->actionFunc == Player_Action_80842180) || (this->actionFunc == Player_Action_8084227C) ||
+           (this->actionFunc == Player_Action_808414F8) || (this->actionFunc == Player_Action_8084193C) ||
+           (this->actionFunc == Player_Action_808423EC);
 }
 
 void Player_ProcessControlStick(PlayState* play, Player* this) {
@@ -6528,6 +6552,12 @@ s32 Player_ActionHandler_11(Player* this, PlayState* play) {
 s32 func_8083C484(Player* this, f32* arg1, s16* arg2) {
     s16 yaw = this->yaw - *arg2;
 
+    // SOH [VR] Direct movement: no pivot brake — reversing the stick just moves the other way
+    // immediately (the body doesn't turn with movement in VR, so there is nothing to pivot).
+    if (Player_VrDirectMovement(this)) {
+        return 0;
+    }
+
     if (ABS(yaw) > 0x6000) {
         if (Player_DecelerateToZero(this)) {
             *arg1 = 0.0f;
@@ -7136,6 +7166,12 @@ void func_8083DDC8(Player* this, PlayState* play) {
 
 void func_8083DF68(Player* this, f32 arg1, s16 arg2) {
     Math_AsymStepToF(&this->linearVelocity, arg1, REG(19) / 100.0f, 1.5f);
+    // SOH [VR] Direct movement: the stick's world direction is used verbatim — velocity goes
+    // exactly where the stick points (relative to the headset), never bent by turn easing.
+    if (Player_VrDirectMovement(this)) {
+        this->yaw = arg2;
+        return;
+    }
     Math_ScaledStepToS(&this->yaw, arg2, REG(27));
 }
 
@@ -7147,6 +7183,14 @@ void func_8083DFE0(Player* this, f32* arg1, s16* arg2) {
             this->linearVelocity =
                 CLAMP(this->linearVelocity, -(R_RUN_SPEED_LIMIT / 100.0f), (R_RUN_SPEED_LIMIT / 100.0f));
         }
+    }
+
+    // SOH [VR] Direct movement: same exact-direction rule for the air/jump variant, and no
+    // reversal brake (the >0x6000 branch below) — air control follows the stick immediately.
+    if (Player_VrDirectMovement(this)) {
+        Math_AsymStepToF(&this->linearVelocity, *arg1, 0.05f, 0.1f);
+        this->yaw = *arg2;
+        return;
     }
 
     if (ABS(yawDiff) > 0x6000) {
@@ -11942,6 +11986,25 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
                 this->actor.world.rot.y = this->yaw;
             }
 
+            // SOH [VR] Kinematic stick movement: while in a neutral locomotion action, velocity is
+            // the stick and nothing else — direction exact, speed linear with deflection, applied
+            // the same frame. No acceleration ramp, no start-step latency, no stop-slide: press a
+            // little, move a little; release, stop. This overrides whatever the (later-running)
+            // action func eased into linearVelocity/yaw, so animations follow movement instead of
+            // gating it. Grounded only — leaving a ledge keeps momentum until the air action takes
+            // over (which has its own VR steering).
+            if (Player_VrDirectMovement(this) && Player_VrIsNeutralLocomotion(this) &&
+                !Player_InBlockingCsMode(play, this) && (this->actor.bgCheckFlags & BGCHECKFLAG_GROUND)) {
+                f32 vrSpeedTarget;
+                s16 vrYawTarget;
+
+                Player_GetMovementSpeedAndYaw(this, &vrSpeedTarget, &vrYawTarget, SPEED_MODE_LINEAR, play);
+                this->linearVelocity = vrSpeedTarget;
+                this->yaw = vrYawTarget;
+                this->actor.speedXZ = vrSpeedTarget;
+                this->actor.world.rot.y = vrYawTarget;
+            }
+
             Actor_UpdateVelocityXZGravity(&this->actor);
 
             if ((this->pushedSpeed != 0.0f) && !Player_InCsMode(play) &&
@@ -12154,6 +12217,20 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
         }
 
         Player_UpdateShapeYaw(this, play);
+
+        // SOH [VR] Body follows head: pin Link's visual facing to the headset heading, overriding
+        // the ease-toward-movement (and lock-on) rotation that Player_UpdateShapeYaw just applied.
+        // This is the last facing writer in the update loop; velocity is built from this->yaw, not
+        // shape.rot.y, so pinning never redirects movement. Skipped in states where the game
+        // choreographs Link's facing (cutscenes, horse, climbing, hanging).
+        if (Player_VrDirectMovement(this) && !Player_InBlockingCsMode(play, this) &&
+            !(this->stateFlags1 & (PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CLIMBING_LADDER |
+                                   PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE)) &&
+            !(this->stateFlags2 & PLAYER_STATE2_CRAWLING)) {
+            s16 vrPinnedYaw = VR_GetHeadingYaw();
+            this->unk_87C = vrPinnedYaw - this->actor.shape.rot.y;
+            this->actor.shape.rot.y = vrPinnedYaw;
+        }
 
         if (CHECK_FLAG_ALL(this->actor.flags, ACTOR_FLAG_TALK)) {
             this->talkActorDistance = 0.0f;

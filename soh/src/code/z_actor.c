@@ -17,6 +17,7 @@
 
 #include "soh/ActorDB.h"
 #include "soh/OTRGlobals.h"
+#include <vr_interface.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -499,38 +500,82 @@ void Attention_Draw(TargetContext* targetCtx, PlayState* play) {
         Attention_SetReticlePos(targetCtx, targetCtx->unk_4C, spBC.x, spBC.y, spBC.z);
 
         if ((!(player->stateFlags1 & PLAYER_STATE1_TALKING)) || (actor != player->focusActor)) {
-            OVERLAY_DISP = Gfx_SetupDL(OVERLAY_DISP, 0x39);
+            // #region SOH [VR] In-world lock-on reticle. The vanilla reticle is a screen-space
+            // overlay effect (triangles converging on the target's projected 2D position) — in VR
+            // that renders on the head-locked HUD quad, telling you nothing about WHICH thing is
+            // locked. Instead, draw the same four converging/spinning triangles as world geometry:
+            // billboarded around the target's 3D position at real stereo depth, wrapping the enemy.
+            // Same colors, trail entries, radii animation and alpha fade as vanilla.
+            if (VR_IsInitialized()) {
+                f32 vrReticleScale = 0.2f * CVarGetFloat("gVrReticleScale", 1.0f);
 
-            for (spB0 = 0, spAC = targetCtx->unk_4C; spB0 < spB8; spB0++, spAC = (spAC + 1) % 3) {
-                entry = &targetCtx->arr_50[spAC];
+                POLY_XLU_DISP = Gfx_SetupDL(POLY_XLU_DISP, 0x7);
 
-                if (entry->unk_0C < 500.0f) {
-                    if (entry->unk_0C <= 120.0f) {
-                        var2 = 0.15f;
-                    } else {
-                        var2 = ((entry->unk_0C - 120.0f) * 0.001f) + 0.15f;
+                for (spB0 = 0, spAC = targetCtx->unk_4C; spB0 < spB8; spB0++, spAC = (spAC + 1) % 3) {
+                    entry = &targetCtx->arr_50[spAC];
+
+                    if (entry->unk_0C < 500.0f) {
+                        Matrix_Translate(targetCtx->targetCenterPos.x, targetCtx->targetCenterPos.y,
+                                         targetCtx->targetCenterPos.z, MTXMODE_NEW);
+                        Matrix_ReplaceRotation(&play->billboardMtxF);
+                        Matrix_RotateZ((targetCtx->unk_4B & 0x7F) * (M_PI / 64), MTXMODE_APPLY);
+                        Matrix_Scale(vrReticleScale, vrReticleScale, vrReticleScale, MTXMODE_APPLY);
+
+                        gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, entry->color.r, entry->color.g, entry->color.b,
+                                        (u8)spCE);
+
+                        for (i = 0; i < 4; i++) {
+                            Matrix_RotateZ(M_PI / 2, MTXMODE_APPLY);
+                            Matrix_Push();
+                            Matrix_Translate(entry->unk_0C, entry->unk_0C, 0.0f, MTXMODE_APPLY);
+                            gSPMatrix(POLY_XLU_DISP++, MATRIX_NEWMTX(play->state.gfxCtx),
+                                      G_MTX_MODELVIEW | G_MTX_LOAD);
+                            gSPDisplayList(POLY_XLU_DISP++, gZTargetLockOnTriangleDL);
+                            Matrix_Pop();
+                        }
                     }
 
-                    Matrix_Translate(entry->pos.x, entry->pos.y, 0.0f, MTXMODE_NEW);
-                    Matrix_Scale(var2, 0.15f, 1.0f, MTXMODE_APPLY);
-
-                    gDPSetPrimColor(OVERLAY_DISP++, 0, 0, entry->color.r, entry->color.g, entry->color.b, (u8)spCE);
-
-                    Matrix_RotateZ((targetCtx->unk_4B & 0x7F) * (M_PI / 64), MTXMODE_APPLY);
-
-                    for (i = 0; i < 4; i++) {
-                        Matrix_RotateZ(M_PI / 2, MTXMODE_APPLY);
-                        Matrix_Push();
-                        Matrix_Translate(entry->unk_0C, entry->unk_0C, 0.0f, MTXMODE_APPLY);
-                        gSPMatrix(OVERLAY_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_MODELVIEW | G_MTX_LOAD);
-                        gSPDisplayList(OVERLAY_DISP++, gZTargetLockOnTriangleDL);
-                        Matrix_Pop();
+                    spCE -= 0xFF / 3;
+                    if (spCE < 0) {
+                        spCE = 0;
                     }
                 }
+            } else {
+                // #endregion
+                OVERLAY_DISP = Gfx_SetupDL(OVERLAY_DISP, 0x39);
 
-                spCE -= 0xFF / 3;
-                if (spCE < 0) {
-                    spCE = 0;
+                for (spB0 = 0, spAC = targetCtx->unk_4C; spB0 < spB8; spB0++, spAC = (spAC + 1) % 3) {
+                    entry = &targetCtx->arr_50[spAC];
+
+                    if (entry->unk_0C < 500.0f) {
+                        if (entry->unk_0C <= 120.0f) {
+                            var2 = 0.15f;
+                        } else {
+                            var2 = ((entry->unk_0C - 120.0f) * 0.001f) + 0.15f;
+                        }
+
+                        Matrix_Translate(entry->pos.x, entry->pos.y, 0.0f, MTXMODE_NEW);
+                        Matrix_Scale(var2, 0.15f, 1.0f, MTXMODE_APPLY);
+
+                        gDPSetPrimColor(OVERLAY_DISP++, 0, 0, entry->color.r, entry->color.g, entry->color.b,
+                                        (u8)spCE);
+
+                        Matrix_RotateZ((targetCtx->unk_4B & 0x7F) * (M_PI / 64), MTXMODE_APPLY);
+
+                        for (i = 0; i < 4; i++) {
+                            Matrix_RotateZ(M_PI / 2, MTXMODE_APPLY);
+                            Matrix_Push();
+                            Matrix_Translate(entry->unk_0C, entry->unk_0C, 0.0f, MTXMODE_APPLY);
+                            gSPMatrix(OVERLAY_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_MODELVIEW | G_MTX_LOAD);
+                            gSPDisplayList(OVERLAY_DISP++, gZTargetLockOnTriangleDL);
+                            Matrix_Pop();
+                        }
+                    }
+
+                    spCE -= 0xFF / 3;
+                    if (spCE < 0) {
+                        spCE = 0;
+                    }
                 }
             }
         }
