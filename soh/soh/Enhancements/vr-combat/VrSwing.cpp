@@ -153,6 +153,11 @@ inline int PrimDetail(int id) {
 VrContactPrim sDebugPrims[VR_PHYS_MAX_CONTACT_PRIMS];
 int sDebugPrimCount = 0;
 
+// Physical blade outline for the overlay (world units): rootA, cornerA, tip, cornerB, rootB —
+// the flat rectangle the solver actually collides, with its tapered point.
+float sDebugBlade[5][3];
+bool sDebugBladeValid = false;
+
 inline int SwordHand() {
     // The sword rides Link's L_HAND limb, which motion-hands drives with the player's RIGHT
     // controller in right-handed mode (see Player_OverrideLimbDrawGameplayVRFirstPerson).
@@ -262,6 +267,18 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
     const Vec3f bladeVec = vsub(tip, base);
     const Vec3f mid = vscale(vadd(base, tip), 0.5f);
 
+    // EXPERIMENTAL: collide with the rendered geometry instead of the collision mesh. The
+    // renderer harvests every triangle it draws near the blade (world space), so the blade
+    // touches exactly what the player sees — including animated enemy models. Scene-poly and
+    // dyna gathering below are skipped in this mode; actor colliders (damage/AC_HARD identity)
+    // are still pushed for events and materials.
+    const bool visualMesh = CVarGetInteger("gVrPhysVisualMesh", 1) != 0;
+    {
+        const float regionCenter[3] = { mid.x, mid.y, mid.z };
+        VR_PhysSetMeshRegion(regionCenter, CVarGetFloat("gVrPhysMeshRadius", 150.0f),
+                             visualMesh ? 1 : 0);
+    }
+
     // Ranked by TRUE segment-to-triangle distance, back-facing surfaces rejected, and sticky
     // across ticks. All three matter — a capture of the corner jitter showed the old gather
     // saturated at its cap with 17 different triangle sets per second, and feeding the solver
@@ -287,7 +304,7 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
     }
 
     CollisionHeader* colHeader = play->colCtx.colHeader;
-    if (colHeader != NULL && colHeader->polyList != NULL && colHeader->vtxList != NULL) {
+    if (!visualMesh && colHeader != NULL && colHeader->polyList != NULL && colHeader->vtxList != NULL) {
         const float kMargin = 20.0f;
         // How far behind a face the blade may be and still be constrained by it. Shallow: a face
         // the blade is deeply behind belongs to another volume (the outside of this wall, the
@@ -389,6 +406,8 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
 
     // Dyna geometry (moving platforms, drawbridges) isn't in the static poly list — a few probe
     // rays supplement it. Static hits dedup against the proximity set by poly pointer.
+    // (Skipped in visual-mesh mode: dyna pieces are rendered geometry and get harvested.)
+    if (!visualMesh) {
     const float kFan = 0.45f; // ~26 degrees
     const Vec3f upNudge = { 0.0f, 12.0f, 0.0f };
     const Vec3f downReach = { 0.0f, -70.0f, 0.0f };
@@ -449,6 +468,7 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
         pr.radius = 0.0f;
         pr.id = PrimId(kPrimKindWall, (int)func_80041F10(&play->colCtx, poly, bgId));
     }
+    } // !visualMesh
 
     // Actor colliders, from this tick's AC registrations (populated: enemies updated before draw).
     CollisionCheckContext* colChk = &play->colChkCtx;
@@ -701,16 +721,58 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
         desc.gripLocalTipM[0] = tipLocal0.x / worldScale;
         desc.gripLocalTipM[1] = tipLocal0.y / worldScale;
         desc.gripLocalTipM[2] = tipLocal0.z / worldScale;
+        // Flat-blade cross-section: half-width vector from the damage cross quad's width
+        // points, expressed grip-locally the same way as the tip — so the physical rectangle
+        // is exactly as wide as the Blade Width slider and lies in the visual blade's plane.
+        {
+            Vec3f widthLocal0 = qrot(effInv, vsub(crossTipB, tip0));
+            // Collider roll: rotate the flat plane about the blade axis (degrees). The model's
+            // width axis isn't guaranteed to match the visual flat of every sword — tune with
+            // the debug outline visible until the cyan rectangle lies in the blade's plane.
+            const float rollDeg = CVarGetFloat("gVrPhysBladeRoll", 0.0f);
+            if (rollDeg != 0.0f) {
+                const Vec3f axis = vnorm(vsub(tipLocal0, baseLocal0));
+                const float half = rollDeg * (3.14159265f / 180.0f) * 0.5f;
+                const float s = sinf(half);
+                const Q4 rollQ = { axis.x * s, axis.y * s, axis.z * s, cosf(half) };
+                widthLocal0 = qrot(rollQ, widthLocal0);
+            }
+            desc.gripLocalEdgeM[0] = widthLocal0.x / worldScale;
+            desc.gripLocalEdgeM[1] = widthLocal0.y / worldScale;
+            desc.gripLocalEdgeM[2] = widthLocal0.z / worldScale;
+            const float taper = CVarGetFloat("gVrPhysBladeTipTaper", 0.2f);
+            desc.tipTaperFrac = taper;
+
+            // Overlay copy of the exact physical rectangle (world units, effective pose).
+            const Q4 effQ = { effQuatArr[0], effQuatArr[1], effQuatArr[2], effQuatArr[3] };
+            const Vec3f taperLocal = vadd(baseLocal0, vscale(vsub(tipLocal0, baseLocal0), 1.0f - taper));
+            const Vec3f pts[5] = { vadd(baseLocal0, widthLocal0), vadd(taperLocal, widthLocal0),
+                                   tipLocal0, vsub(taperLocal, widthLocal0),
+                                   vsub(baseLocal0, widthLocal0) };
+            for (int i = 0; i < 5; i++) {
+                const Vec3f w = vadd(effPos, qrot(effQ, pts[i]));
+                sDebugBlade[i][0] = w.x;
+                sDebugBlade[i][1] = w.y;
+                sDebugBlade[i][2] = w.z;
+            }
+            sDebugBladeValid = true;
+        }
         desc.contactEnabled = 1;
         desc.restitution = CVarGetFloat("gVrPhysBounceRestitution", 0.25f);
         // Low default friction: steel skates along stone/flesh instead of planting.
-        desc.friction = CVarGetFloat("gVrPhysBladeFriction", 0.15f);
+        desc.friction = CVarGetFloat("gVrPhysBladeFriction", 0.3f);
         // Contact distances are authored in GAME UNITS (what the blade-length sliders use) and
         // converted to meters here, so they mean the same thing at any world scale.
         desc.bladeRadiusM = CVarGetFloat("gVrPhysBladeThickness", 0.4f) / worldScale;
         desc.speculativeM = CVarGetFloat("gVrPhysContactReach", 1.6f) / worldScale;
         desc.touchToleranceM = CVarGetFloat("gVrPhysTouchTolerance", 0.3f) / worldScale;
         desc.maxAngAccel = CVarGetFloat("gVrPhysMaxAngAccel", 3000.0f);
+        desc.pivotOnly = CVarGetInteger("gVrPhysPivotOnly", 1);
+        // Committed swings cut THROUGH instead of snagging; default matches the damage tier
+        // ("fast enough to hurt = fast enough to cut through").
+        desc.passthroughSpeedMps = CVarGetFloat("gVrPhysPassthroughSpeed", 2.2f);
+        desc.cutDragFlesh = CVarGetFloat("gVrPhysCutDragFlesh", 0.55f);
+        desc.cutDragWorld = CVarGetFloat("gVrPhysCutDragWorld", 0.2f);
         desc.angFreqHz = CVarGetFloat("gVrPhysSwordAngFreq", 30.0f);
         desc.maxAccelMps2 = CVarGetFloat("gVrPhysMaxAccel", 400.0f);
         VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, &desc);
@@ -718,6 +780,8 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
     } else {
         VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, NULL);
         VR_PhysSetContactPrims(NULL, 0);
+        VR_PhysSetMeshRegion(NULL, 0.0f, 0);
+        sDebugBladeValid = false;
     }
 
     // ---- 3. Mirror the melee state for everyone who reads it ----
@@ -922,6 +986,14 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
     sQuadsUsed = 0;
 }
 
+int Swing_GetDebugBladeOutline(float* outPts5x3) {
+    if (!sDebugBladeValid) {
+        return 0;
+    }
+    memcpy(outPts5x3, sDebugBlade, sizeof(sDebugBlade));
+    return 5;
+}
+
 int Swing_GetDebugContactPrims(VrContactPrim* out, int maxPrims) {
     const int n = sDebugPrimCount < maxPrims ? sDebugPrimCount : maxPrims;
     memcpy(out, sDebugPrims, sizeof(VrContactPrim) * n);
@@ -944,9 +1016,11 @@ void Swing_Deactivate(PlayState* play, Player* player) {
     // Falling edge of VrCombat_Active(): hand the melee state back to vanilla cleanly.
     VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, NULL);
     VR_PhysSetContactPrims(NULL, 0);
+    VR_PhysSetMeshRegion(NULL, 0.0f, 0);
     sTier = TIER_IDLE;
     sHaveBladePrev = false;
     sPendingStrikeCount = 0;
+    sDebugBladeValid = false;
     player->meleeWeaponState = 0;
     player->meleeWeaponInfo[0].active = 0;
     player->meleeWeaponInfo[1].active = 0;

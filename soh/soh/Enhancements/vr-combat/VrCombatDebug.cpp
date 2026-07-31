@@ -129,6 +129,10 @@ extern "C" void VrCombat_DrawDebugOverlay(void) {
 
     PushSetupGfx();
 
+    // The overlay draws world-space geometry ON the blade (outline, contact markers) — it must
+    // never be harvested as collision geometry or the blade collides with its own debug draw.
+    sDl.push_back(gsSPVrPhysMask(1));
+
     const Vec3f camEye = gPlayState->view.eye;
 
     for (int hand = 0; hand < 2; hand++) {
@@ -210,6 +214,36 @@ extern "C" void VrCombat_DrawDebugOverlay(void) {
         }
     }
 
+    // Visual-mesh mode: the harvested triangles the solver is actually colliding against
+    // (magenta wireframe) — the ground truth of what the blade "sees" this frame.
+    {
+        float meshTris[32 * 9];
+        const int meshTriCount = VR_PhysGetMeshDebugTris(meshTris, 32);
+        if (meshTriCount > 0) {
+            sDl.push_back(gsDPSetPrimColor(0, 0, 235, 80, 235, 255));
+            for (int i = 0; i < meshTriCount; i++) {
+                const float* t = &meshTris[i * 9];
+                const Vec3f a = { t[0], t[1], t[2] };
+                const Vec3f b = { t[3], t[4], t[5] };
+                const Vec3f c = { t[6], t[7], t[8] };
+                PushRibbon(a, b, camEye, 0.5f);
+                PushRibbon(b, c, camEye, 0.5f);
+                PushRibbon(c, a, camEye, 0.5f);
+            }
+        }
+    }
+
+    // The physical blade rectangle (cyan outline): the exact collider the solver sweeps.
+    float bladePts[5 * 3];
+    if (VrCombat::Swing_GetDebugBladeOutline(bladePts) == 5) {
+        sDl.push_back(gsDPSetPrimColor(0, 0, 60, 235, 255, 255));
+        for (int i = 0; i < 5; i++) {
+            const int j = (i + 1) % 5;
+            PushRibbon({ bladePts[i * 3], bladePts[i * 3 + 1], bladePts[i * 3 + 2] },
+                       { bladePts[j * 3], bladePts[j * 3 + 1], bladePts[j * 3 + 2] }, camEye, 0.6f);
+        }
+    }
+
     // Active blade contacts from the sim (yellow: point + normal), the ground truth of what the
     // solver is actually pressing against right now.
     float contactPos[4 * 3];
@@ -238,6 +272,7 @@ extern "C" void VrCombat_DrawDebugOverlay(void) {
         }
     }
 
+    sDl.push_back(gsSPVrPhysMask(0));
     sDl.push_back(gsSPEndDisplayList());
 
     OPEN_DISPS(gPlayState->state.gfxCtx);

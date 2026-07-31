@@ -89,6 +89,25 @@ extern "C" bool VrCombat_Active(void) {
     return true;
 }
 
+// The mask must live IN the display lists: draws here only BUILD Gfx commands, while the
+// harvest runs later when the interpreter EXECUTES them. The marker opcode toggles the mask
+// at execution time, bracketing the excluded section in both the OPA and XLU buckets.
+extern "C" void VrCombat_MeshMaskPush(GraphicsContext* gfxCtx) {
+    if (!VrCombat_Active() || !CVarGetInteger("gVrPhysVisualMesh", 1)) {
+        return;
+    }
+    gSPVrPhysMask(gfxCtx->polyOpa.p++, 1);
+    gSPVrPhysMask(gfxCtx->polyXlu.p++, 1);
+}
+
+extern "C" void VrCombat_MeshMaskPop(GraphicsContext* gfxCtx) {
+    if (!VrCombat_Active() || !CVarGetInteger("gVrPhysVisualMesh", 1)) {
+        return;
+    }
+    gSPVrPhysMask(gfxCtx->polyOpa.p++, 0);
+    gSPVrPhysMask(gfxCtx->polyXlu.p++, 0);
+}
+
 namespace VrCombat {
 
 const TickPath& GetTickPath(int hand) {

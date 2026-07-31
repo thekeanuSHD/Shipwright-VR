@@ -2,6 +2,7 @@
 #include "objects/gameplay_keep/gameplay_keep.h"
 
 #include "soh/frame_interpolation.h"
+#include "soh/Enhancements/vr-combat/VrCombat.h"
 #include <assert.h>
 
 void EffectBlure_AddVertex(EffectBlure* this, Vec3f* p1, Vec3f* p2) {
@@ -1076,6 +1077,9 @@ void EffectBlure_Draw(void* thisx, GraphicsContext* gfxCtx) {
     FrameInterpolation_RecordOpenChild(this, 0);
     OPEN_DISPS(gfxCtx);
 
+    // SOH [VR] Trails (sword blure) must not become collision geometry for the physical blade.
+    VrCombat_MeshMaskPush(gfxCtx);
+
     gSPMatrix(POLY_XLU_DISP++, &gMtxClear, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
 
     if (this->numElements != 0) {
@@ -1183,6 +1187,9 @@ void EffectBlure_Draw(void* thisx, GraphicsContext* gfxCtx) {
             EffectBlure_DrawSmooth(this, gfxCtx);
         }
     }
+
+    // SOH [VR]
+    VrCombat_MeshMaskPop(gfxCtx);
 
     CLOSE_DISPS(gfxCtx);
     FrameInterpolation_RecordCloseChild();

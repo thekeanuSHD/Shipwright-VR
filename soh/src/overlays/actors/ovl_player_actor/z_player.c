@@ -12603,6 +12603,10 @@ void Player_Draw(Actor* thisx, PlayState* play2) {
     Vec3s rot;
     f32 scale;
 
+    // SOH [VR] Physical combat: the player's own arms/weapon must not be harvested as
+    // collision geometry for the blade (visual-mesh mode).
+    VrCombat_MeshMaskPush(play->state.gfxCtx);
+
     if (LINK_AGE_IN_YEARS == YEARS_CHILD) {
         pos.x = 2.0f;
         pos.y = -130.0f;
@@ -12717,6 +12721,9 @@ void Player_Draw(Actor* thisx, PlayState* play2) {
             Player_DrawGetItem(play, this);
         }
     }
+
+    // SOH [VR]
+    VrCombat_MeshMaskPop(play->state.gfxCtx);
 
     CLOSE_DISPS(play->state.gfxCtx);
 }

@@ -625,6 +625,39 @@ void SohMenu::AddMenuVRSettings() {
                      .Tooltip("Collision thickness of the blade (game units) - how far the steel "
                               "rests off a surface it is pressed against. Lower = the blade "
                               "visually touches walls more closely."));
+    AddWidget(physPath, "Collide With Visual Meshes (Experimental)", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrPhysVisualMesh")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(CheckboxOptions()
+                     .DefaultValue(true)
+                     .Tooltip("EXPERIMENTAL: the blade collides with the rendered geometry you "
+                              "actually see (harvested from the renderer, animated enemies "
+                              "included) instead of the simplified collision mesh. Turn off to "
+                              "fall back to collision-mesh physics."));
+    AddWidget(physPath, "Blade Collider Roll: %.0f deg", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeRoll")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(-180.0f)
+                     .Max(180.0f)
+                     .DefaultValue(0.0f)
+                     .Step(5.0f)
+                     .Format("%.0f")
+                     .Tooltip("Rotates the flat blade collider about the blade axis. Turn on the "
+                              "debug overlay and adjust until the cyan rectangle lies in the "
+                              "same plane as the visible blade."));
+    AddWidget(physPath, "Blade Tip Taper: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeTipTaper")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(0.5f)
+                     .DefaultValue(0.2f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("The blade collider is a flat rectangle as wide as Blade Width, "
+                              "converging to a point over this trailing fraction of its length. "
+                              "0 = square tip, 0.2 = pointed over the last 20%."));
     AddWidget(physPath, "Impact Tolerance: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysTouchTolerance")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
@@ -649,6 +682,53 @@ void SohMenu::AddMenuVRSettings() {
                      .Format("%.2f")
                      .Tooltip("How much the blade rebounds off surfaces it can't cut. 0 = dead "
                               "stop and slide, 1 = full elastic bounce."));
+    AddWidget(physPath, "Swing-Through Speed: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysPassthroughSpeed")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(8.0f)
+                     .DefaultValue(2.2f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Swings faster than this cut THROUGH surfaces instead of stopping "
+                              "on them; gentle contact still rests on the surface. 0 = the "
+                              "blade never passes through anything."));
+    AddWidget(physPath, "Cut Resistance (Flesh): %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysCutDragFlesh")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(0.97f)
+                     .DefaultValue(0.55f)
+                     .Step(0.01f)
+                     .Format("%.2f")
+                     .Tooltip("How much enemy bodies hold the blade back while a fast swing "
+                              "cuts through them. The blade drags in the cut (with rumble) and "
+                              "catches up to your hand on exit. 0 = clean effortless cuts."));
+    AddWidget(physPath, "Cut Resistance (World): %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysCutDragWorld")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(0.97f)
+                     .DefaultValue(0.2f)
+                     .Step(0.01f)
+                     .Format("%.2f")
+                     .Tooltip("Drag while a fast swing passes through world geometry (walls, "
+                              "fences). Light by default so committed swings stay fluid."));
+    AddWidget(physPath, "Blade Friction: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeFriction")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(1.0f)
+                     .DefaultValue(0.3f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("How much the blade drags while sliding along a surface. 0 = "
+                              "frictionless skating, higher = the blade angle sticks and trails "
+                              "as you drag it across walls and floors."));
 
     AddWidget(physPath, "Diagnostics", WIDGET_SEPARATOR_TEXT);
     AddWidget(physPath, "Record Physics Log", WIDGET_CVAR_CHECKBOX)

@@ -45,6 +45,12 @@ bool VrCombat_MeleeQuadsHit(void);
 // 0 -> nonzero edge. The vr-combat module drives the state from real hand motion.
 void VrCombat_SetMeleeWeaponState(struct Player* player, int32_t newState);
 
+// Visual-mesh harvest exclusion: brackets a display-list section the physical blade must NOT
+// collide with (the player's own arms/weapon, the sword trail) by emitting mask marker
+// commands into the OPA and XLU buckets. No-ops while physical combat is inactive.
+void VrCombat_MeshMaskPush(struct GraphicsContext* gfxCtx);
+void VrCombat_MeshMaskPop(struct GraphicsContext* gfxCtx);
+
 #ifdef __cplusplus
 }
 
@@ -80,6 +86,9 @@ void Swing_Deactivate(PlayState* play, Player* player);
 // never needs the game's Vec3f type.
 int Swing_GetDebugContactPrims(VrContactPrim* out, int maxPrims);
 int Swing_GetDebugQuads(float* outVerts12PerQuad, int maxQuads);
+// Physical blade rectangle outline (5 world-unit points: rootA, cornerA, tip, cornerB, rootB);
+// returns 0 when the sim blade is inactive.
+int Swing_GetDebugBladeOutline(float* outPts5x3);
 
 } // namespace VrCombat
 #endif
