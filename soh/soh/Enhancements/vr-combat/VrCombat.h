@@ -1,0 +1,85 @@
+#pragma once
+
+// VR Physical Combat (gVrPhysCombat): motion-driven melee, shield, carrying and archery,
+// replacing the animation-driven systems while active. This header is the module's surface for
+// both the C decomp code (master predicate + per-frame shims, added milestone by milestone) and
+// the module's own C++ files (soh/soh/Enhancements/vr-combat/).
+//
+// Game types appear only as pointers to tagged structs (struct Player / struct PlayState), so
+// the header stays includable from any TU; consumers that pass real objects naturally already
+// include the game headers.
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Master predicate: true only when every physical-combat patch should take the VR path THIS
+// frame — VR first person with the toggle on, a save loaded, and no state where the game owns
+// Link's hands (cutscene, forced action, screen transition). Decomp patches call this and fall
+// back to vanilla when false, so scripted sequences behave stock frame-by-frame.
+bool VrCombat_Active(void);
+
+// --- Physical melee (VrSwing.cpp) ---
+
+// The held melee weapon is handled by physical combat: 1H swords (Master/Kokiri) and the broken
+// Giant's Knife. Sticks, hammer and the full Biggoron Sword keep vanilla button combat until
+// their own milestones. Also false for the co-op partner (only the real player swings).
+bool VrCombat_MeleeCovered(struct Player* player);
+
+// Draw-time feed, called from the Player L_HAND PostLimbDraw seam with the live (controller)
+// matrix on the stack and the blade length already configured (D_80126080.x). Tracks swing
+// speed, mirrors meleeWeaponState for enemy AI, feeds the sword trail, and registers velocity-
+// gated swept sub-quads as AT colliders.
+void VrCombat_FeedMelee(struct PlayState* play, struct Player* player);
+
+// True while any physical-melee quad has an AT hit recorded this tick. OR'd into the vanilla
+// "landing an attack cancels incoming damage this frame" check, which only knows about the
+// player's own two quads.
+bool VrCombat_MeleeQuadsHit(void);
+
+// Implemented in z_player.c (// SOH [VR]): forwards to the file-internal melee-weapon-state
+// setter func_80833A20, which plays the swing SFX / voice and counts the swing stat on the
+// 0 -> nonzero edge. The vr-combat module drives the state from real hand motion.
+void VrCombat_SetMeleeWeaponState(struct Player* player, int32_t newState);
+
+#ifdef __cplusplus
+}
+
+// C++-side module internals (swing tracking, debug overlay, menu readouts).
+#include <vr_interface.h>
+
+// Global-scope forward declarations, NOT `struct X` inside the namespace: an elaborated type
+// specifier in a namespace-scope parameter would silently declare a fresh VrCombat::X in any TU
+// that includes this header before the game headers.
+struct PlayState;
+struct Player;
+
+namespace VrCombat {
+
+// Hand path drained this game tick: world-space samples at headset rate, oldest first. Drained
+// exactly once per tick into this snapshot so every consumer sees the same data. 24 covers a
+// 20 Hz tick of 120 Hz XR frames (~6) with generous slack for hitches.
+struct TickPath {
+    VrHandSample samples[24];
+    int count;
+};
+const TickPath& GetTickPath(int hand);
+
+// Per-tick swing bookkeeping (VrSwing.cpp), driven from VrCombat's OnPlayerUpdate hook:
+// reads back last tick's quad results (hit haptics, one-hit-per-swing demotion), then resets
+// the quads' AT flags for the coming draw.
+void Swing_OnPlayerUpdate(PlayState* play, Player* player);
+// Falling edge of VrCombat_Active(): hand melee state back to vanilla (state 0, trail off).
+void Swing_Deactivate(PlayState* play, Player* player);
+
+// Debug-overlay snapshots (this tick): the blade's contact-primitive set, and this draw's
+// registered damage quads as 12 floats each (4 verts x xyz). Plain float arrays so this header
+// never needs the game's Vec3f type.
+int Swing_GetDebugContactPrims(VrContactPrim* out, int maxPrims);
+int Swing_GetDebugQuads(float* outVerts12PerQuad, int maxQuads);
+
+} // namespace VrCombat
+#endif

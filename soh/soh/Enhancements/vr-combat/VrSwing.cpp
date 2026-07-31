@@ -1,0 +1,962 @@
+extern "C" {
+#include "z64.h"
+#include "macros.h"
+#include "functions.h"
+#include "sfx.h"
+extern PlayState* gPlayState;
+}
+
+#include "VrCombat.h"
+
+#include "soh/cvar_prefixes.h"
+#include <libultraship/bridge/consolevariablebridge.h>
+#include <vr_interface.h>
+#include <cmath>
+
+// Physical melee: the sword hits because it physically swept through the target fast enough.
+//
+// Per draw frame (from the L_HAND PostLimbDraw seam, live controller matrix on the stack):
+//  1. Blade tip speed is measured over this tick's headset-rate hand path (m/s, world-scale and
+//     age independent).
+//  2. A hysteresis tier machine runs: IDLE below gVrPhysArmSpeed; ARMED (windup — enemies see
+//     meleeWeaponState -1 and start their guard/dodge reactions) above it; HOT above
+//     gVrPhysHitSpeed; back to IDLE when the swing decays below gVrPhysReArmSpeed.
+//  3. While HOT, the tick's blade motion is registered as swept AT quads — the same collider
+//     construction the vanilla game uses (quad = line at t0 -> line at t1, two skewed edge lines
+//     so even a straight stab has quad area), but sub-sampled up to 3 time segments per tick so
+//     a fast arc keeps its shape instead of cutting the corner.
+//  4. Damage class: normal HOT swings carry the weapon's slash dmgFlags; swings past
+//     gVrPhysHeavySpeed carry its jump-slash dmgFlags (~2x in enemy damage tables) — every
+//     enemy's authored damage table and vulnerability set keeps working untouched.
+//  5. On a recorded hit the tier drops back to ARMED: one strike per swing, re-cross the hit
+//     speed to strike again (enemy i-frames additionally gate repeats on their side).
+//
+// Historical blade positions are reconstructed exactly: the blade's grip-local geometry
+// (calibration, mirroring and model scale baked in) is extracted once per frame by expressing
+// the live matrix output in the newest grip pose's frame, then re-applied to each older grip
+// sample. The one approximation is the camera anchor, which moved slightly within the tick.
+
+namespace {
+
+constexpr int kMaxQuads = 6; // 3 time segments x 2 edge lines
+
+ColliderQuad sQuads[kMaxQuads];
+PlayState* sQuadsPlay = nullptr;
+int sQuadsUsed = 0;
+
+enum SwingTier { TIER_IDLE = 0, TIER_ARMED, TIER_HOT };
+int sTier = TIER_IDLE;
+float sTickTipSpeed = 0.0f;  // max blade-midpoint speed measured this tick, m/s
+float sTickHandSpeed = 0.0f; // max raw hand speed this tick, m/s (the anti-wrist-flick floor)
+
+// Last frame's edge-line endpoints (world), the fallback sweep when a tick has too few samples.
+bool sHaveBladePrev = false;
+Vec3f sPrevTip[2];
+Vec3f sPrevBase[2];
+
+// Mirror of the player melee quad init (D_80854650, z_player.c) with TOUCH_NEAREST from the
+// start: each quad damages only its nearest victim, like every vanilla sword quad.
+ColliderQuadInit sVrQuadInit = {
+    {
+        COLTYPE_NONE,
+        AT_ON | AT_TYPE_PLAYER,
+        AC_NONE,
+        OC1_NONE,
+        OC2_TYPE_PLAYER,
+        COLSHAPE_QUAD,
+    },
+    {
+        ELEMTYPE_UNK2,
+        { 0x00000100, 0x00, 0x01 },
+        { 0xFFCFFFFF, 0x00, 0x00 },
+        TOUCH_ON | TOUCH_NEAREST,
+        BUMP_NONE,
+        OCELEM_NONE,
+    },
+    { { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } } },
+};
+
+// Per-weapon [slash, jump-slash] dmgFlags, rows matching vanilla D_80854488 (z_player.c):
+// Master, Kokiri (also broken Giant's Knife), Biggoron.
+constexpr uint32_t kDmgFlags[3][2] = {
+    { 0x00000200, 0x08000000 },
+    { 0x00000100, 0x02000000 },
+    { 0x00000400, 0x04000000 },
+};
+
+struct Q4 {
+    float x, y, z, w;
+};
+inline Q4 qconj(const Q4& q) {
+    return { -q.x, -q.y, -q.z, q.w };
+}
+inline Vec3f qrot(const Q4& q, const Vec3f& v) {
+    const float tx = 2.0f * (q.y * v.z - q.z * v.y);
+    const float ty = 2.0f * (q.z * v.x - q.x * v.z);
+    const float tz = 2.0f * (q.x * v.y - q.y * v.x);
+    return { v.x + q.w * tx + (q.y * tz - q.z * ty), v.y + q.w * ty + (q.z * tx - q.x * tz),
+             v.z + q.w * tz + (q.x * ty - q.y * tx) };
+}
+inline Vec3f vsub(const Vec3f& a, const Vec3f& b) {
+    return { a.x - b.x, a.y - b.y, a.z - b.z };
+}
+inline Vec3f vadd(const Vec3f& a, const Vec3f& b) {
+    return { a.x + b.x, a.y + b.y, a.z + b.z };
+}
+inline Vec3f vscale(const Vec3f& a, float s) {
+    return { a.x * s, a.y * s, a.z * s };
+}
+inline float vdot(const Vec3f& a, const Vec3f& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+inline float vdist(const Vec3f& a, const Vec3f& b) {
+    const Vec3f d = vsub(a, b);
+    return sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+}
+inline Vec3f vcross(const Vec3f& a, const Vec3f& b) {
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+inline Vec3f vnorm(const Vec3f& a) {
+    const float m = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+    return (m > 1e-6f) ? vscale(a, 1.0f / m) : Vec3f{ 0.0f, 1.0f, 0.0f };
+}
+
+// Physical impacts recorded by the sim that must become damage. With hard-stop collision the
+// blade halts AT an enemy's collider surface, so the swept quads only graze it — instead, each
+// damaging contact registers a small "strike quad" poked through the surface at the impact
+// point on the next draw, and the vanilla AT-vs-AC pipeline (damage tables, effects, drops)
+// does the rest. TOUCH_NEAREST makes it hit exactly the struck target.
+struct PendingStrike {
+    Vec3f pos;
+    Vec3f normal;
+    uint32_t dmgFlags;
+};
+PendingStrike sPendingStrikes[4];
+int sPendingStrikeCount = 0;
+
+// Contact-prim id tags: what kind of thing a prim is (echoed back in contact events, so impact
+// sounds/effects can match the material exactly like the vanilla sword-recoil path does).
+constexpr int kPrimKindWall = 1;  // low bits = func_80041F10 surface sfx material
+constexpr int kPrimKindHard = 2;  // low bits = collider colType (metal/wood/hard)
+constexpr int kPrimKindFlesh = 3; // enemy body — silent on touch; damage sounds come from AT/AC
+inline int PrimId(int kind, int detail) {
+    return (kind << 12) | (detail & 0xFFF);
+}
+inline int PrimKind(int id) {
+    return id >> 12;
+}
+inline int PrimDetail(int id) {
+    return id & 0xFFF;
+}
+
+// Copy of the last prim set + registered quads for the debug overlay.
+VrContactPrim sDebugPrims[VR_PHYS_MAX_CONTACT_PRIMS];
+int sDebugPrimCount = 0;
+
+inline int SwordHand() {
+    // The sword rides Link's L_HAND limb, which motion-hands drives with the player's RIGHT
+    // controller in right-handed mode (see Player_OverrideLimbDrawGameplayVRFirstPerson).
+    return CVarGetInteger("gVrLeftHanded", 0) ? VR_HAND_LEFT : VR_HAND_RIGHT;
+}
+
+// Blade length in hand-model units (sliders are in game units; model = x100 before actor scale).
+// Defaults match the visual blades (the vanilla trail tips): Kokiri 30, Master 40, Biggoron 55.
+float BladeLengthModelUnits(Player* player) {
+    const s32 held = Player_GetMeleeWeaponHeld(player);
+    if (held == 3 && Player_HoldsBrokenKnife(player)) {
+        return 1500.0f; // broken Giant's Knife stub
+    }
+    switch (held) {
+        case 1:
+            return CVarGetFloat("gVrPhysBladeLenMaster", 40.0f) * 100.0f;
+        case 2:
+            return CVarGetFloat("gVrPhysBladeLenKokiri", 30.0f) * 100.0f;
+        case 3:
+            return CVarGetFloat("gVrPhysBladeLenBiggoron", 55.0f) * 100.0f;
+        default:
+            return 3000.0f;
+    }
+}
+
+inline Vec3f rotY(const Vec3f& v, float rad) {
+    const float c = cosf(rad);
+    const float s = sinf(rad);
+    return { c * v.x + s * v.z, v.y, -s * v.x + c * v.z };
+}
+inline bool PointInTri(const Vec3f& p, const Vec3f& a, const Vec3f& b, const Vec3f& c, const Vec3f& n) {
+    if (vdot(vcross(vsub(b, a), vsub(p, a)), n) < 0.0f) {
+        return false;
+    }
+    if (vdot(vcross(vsub(c, b), vsub(p, b)), n) < 0.0f) {
+        return false;
+    }
+    return vdot(vcross(vsub(a, c), vsub(p, c)), n) >= 0.0f;
+}
+
+inline float SegPointDist2(const Vec3f& a, const Vec3f& b, const Vec3f& p) {
+    const Vec3f ab = vsub(b, a);
+    const float len2 = ab.x * ab.x + ab.y * ab.y + ab.z * ab.z;
+    float t = 0.0f;
+    if (len2 > 1e-6f) {
+        t = ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y + (p.z - a.z) * ab.z) / len2;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    }
+    const Vec3f q = vadd(a, vscale(ab, t));
+    const Vec3f d = vsub(p, q);
+    return d.x * d.x + d.y * d.y + d.z * d.z;
+}
+
+inline float PointTriDist2(const Vec3f& p, const Vec3f& a, const Vec3f& b, const Vec3f& c, const Vec3f& n) {
+    const float sd = vdot(vsub(p, a), n);
+    const Vec3f proj = vsub(p, vscale(n, sd));
+    if (PointInTri(proj, a, b, c, n)) {
+        return sd * sd;
+    }
+    const float e0 = SegPointDist2(a, b, p);
+    const float e1 = SegPointDist2(b, c, p);
+    const float e2 = SegPointDist2(c, a, p);
+    return fminf(e0, fminf(e1, e2));
+}
+
+// True distance^2 from the blade segment to a triangle, plus how far the blade's nearer endpoint
+// sits in FRONT of the face (negative = behind). Centroid distance — the old ranking — is wrong
+// for level geometry: a big wall triangle you're leaning on has a distant centroid and loses to
+// small irrelevant tris, so the kept set churned every tick.
+inline float SegTriDist2(const Vec3f& s0, const Vec3f& s1, const Vec3f& a, const Vec3f& b, const Vec3f& c,
+                         const Vec3f& n, float& outFrontMost) {
+    const float d0 = vdot(vsub(s0, a), n);
+    const float d1 = vdot(vsub(s1, a), n);
+    outFrontMost = fmaxf(d0, d1);
+    if ((d0 > 0.0f) != (d1 > 0.0f)) {
+        const float t = d0 / (d0 - d1);
+        const Vec3f x = vadd(s0, vscale(vsub(s1, s0), t));
+        if (PointInTri(x, a, b, c, n)) {
+            return 0.0f;
+        }
+    }
+    float best = fminf(PointTriDist2(s0, a, b, c, n), PointTriDist2(s1, a, b, c, n));
+    best = fminf(best, SegPointDist2(s0, s1, a));
+    best = fminf(best, SegPointDist2(s0, s1, b));
+    best = fminf(best, SegPointDist2(s0, s1, c));
+    return best;
+}
+
+// Push this tick's contact primitives: what the virtual blade must NOT pass through — the blade
+// is always a solid object, at any speed. Level geometry (short line probes around the blade),
+// hard actor colliders (AC_HARD — armor, carapaces, enemy shields), and enemy bodies, all
+// treated identically. Breakables (pots, bushes) are deliberately NOT solid: the blade passes
+// through and the swept quads smash them.
+void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const Vec3f& tip) {
+    VrContactPrim prims[VR_PHYS_MAX_CONTACT_PRIMS];
+    int n = 0;
+    memset(prims, 0, sizeof(prims));
+
+    // ---- Level geometry ----
+    // PROXIMITY gather over the scene's static polygons: cheap integer AABB reject against the
+    // blade's inflated bounds, keep the nearest N by distance to the blade segment. Ray-based
+    // discovery flickered whenever the blade lay parallel to the surfaces that mattered
+    // (pressing the blade's SIDE against a 90-degree corner: rays along the blade graze past
+    // both faces) — and a face that blinks out of the contact set for one tick lets the spring
+    // bury the blade, then the snap-back when it reappears is the corner jitter. Proximity is
+    // orientation-independent: every nearby face constrains, every tick, unconditionally.
+    const Vec3f bladeVec = vsub(tip, base);
+    const Vec3f mid = vscale(vadd(base, tip), 0.5f);
+
+    // Ranked by TRUE segment-to-triangle distance, back-facing surfaces rejected, and sticky
+    // across ticks. All three matter — a capture of the corner jitter showed the old gather
+    // saturated at its cap with 17 different triangle sets per second, and feeding the solver
+    // opposing normals (+x and -x simultaneously) from the far side of a neighbouring wall.
+    constexpr int kMaxLevelTris = 16;
+    struct LevelCand {
+        float d2;
+        float rank; // d2 biased by stickiness — ranking only, never a real distance
+        CollisionPoly* poly;
+    };
+    LevelCand cands[kMaxLevelTris];
+    int candCount = 0;
+
+    // Triangles chosen last tick: preferred while they remain plausible, so the constraint set
+    // stays put instead of swapping members every tick (which dropped contacts to zero and let
+    // the spring lunge, then snap back — the jitter cycle).
+    static CollisionPoly* sStickyPolys[kMaxLevelTris];
+    static int sStickyCount = 0;
+    static PlayState* sStickyPlay = NULL;
+    if (sStickyPlay != play) {
+        sStickyPlay = play;
+        sStickyCount = 0;
+    }
+
+    CollisionHeader* colHeader = play->colCtx.colHeader;
+    if (colHeader != NULL && colHeader->polyList != NULL && colHeader->vtxList != NULL) {
+        const float kMargin = 20.0f;
+        // How far behind a face the blade may be and still be constrained by it. Shallow: a face
+        // the blade is deeply behind belongs to another volume (the outside of this wall, the
+        // ceiling of the room below) and pushing off it drives the blade the wrong way.
+        const float kBackMargin = 4.0f;
+        const float minX = fminf(base.x, tip.x) - kMargin;
+        const float maxX = fmaxf(base.x, tip.x) + kMargin;
+        const float minY = fminf(base.y, tip.y) - kMargin;
+        const float maxY = fmaxf(base.y, tip.y) + kMargin;
+        const float minZ = fminf(base.z, tip.z) - kMargin;
+        const float maxZ = fmaxf(base.z, tip.z) + kMargin;
+
+        for (int pi = 0; pi < colHeader->numPolygons; pi++) {
+            CollisionPoly* poly = &colHeader->polyList[pi];
+            const Vec3s* va = &colHeader->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIA)];
+            const Vec3s* vb = &colHeader->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIB)];
+            const Vec3s* vc = &colHeader->vtxList[COLPOLY_VTX_INDEX(poly->vIC)];
+            const s16 txMin = va->x < vb->x ? (va->x < vc->x ? va->x : vc->x) : (vb->x < vc->x ? vb->x : vc->x);
+            const s16 txMax = va->x > vb->x ? (va->x > vc->x ? va->x : vc->x) : (vb->x > vc->x ? vb->x : vc->x);
+            if (txMax < minX || txMin > maxX) {
+                continue;
+            }
+            const s16 tyMin = va->y < vb->y ? (va->y < vc->y ? va->y : vc->y) : (vb->y < vc->y ? vb->y : vc->y);
+            const s16 tyMax = va->y > vb->y ? (va->y > vc->y ? va->y : vc->y) : (vb->y > vc->y ? vb->y : vc->y);
+            if (tyMax < minY || tyMin > maxY) {
+                continue;
+            }
+            const s16 tzMin = va->z < vb->z ? (va->z < vc->z ? va->z : vc->z) : (vb->z < vc->z ? vb->z : vc->z);
+            const s16 tzMax = va->z > vb->z ? (va->z > vc->z ? va->z : vc->z) : (vb->z > vc->z ? vb->z : vc->z);
+            if (tzMax < minZ || tzMin > maxZ) {
+                continue;
+            }
+
+            const Vec3f p0 = { (float)va->x, (float)va->y, (float)va->z };
+            const Vec3f p1 = { (float)vb->x, (float)vb->y, (float)vb->z };
+            const Vec3f p2 = { (float)vc->x, (float)vc->y, (float)vc->z };
+            const Vec3f nrm = { COLPOLY_GET_NORMAL(poly->normal.x), COLPOLY_GET_NORMAL(poly->normal.y),
+                                COLPOLY_GET_NORMAL(poly->normal.z) };
+            float frontMost;
+            const float d2 = SegTriDist2(base, tip, p0, p1, p2, nrm, frontMost);
+            if (frontMost < -kBackMargin) {
+                continue; // blade is entirely behind this face: it belongs to another volume
+            }
+
+            float rank = d2;
+            for (int s = 0; s < sStickyCount; s++) {
+                if (sStickyPolys[s] == poly) {
+                    rank *= 0.5f; // hysteresis: keep what already constrains the blade
+                    break;
+                }
+            }
+            if (candCount < kMaxLevelTris) {
+                cands[candCount].d2 = d2;
+                cands[candCount].rank = rank;
+                cands[candCount].poly = poly;
+                candCount++;
+            } else {
+                int worst = 0;
+                for (int cIdx = 1; cIdx < kMaxLevelTris; cIdx++) {
+                    if (cands[cIdx].rank > cands[worst].rank) {
+                        worst = cIdx;
+                    }
+                }
+                if (rank < cands[worst].rank) {
+                    cands[worst].d2 = d2;
+                    cands[worst].rank = rank;
+                    cands[worst].poly = poly;
+                }
+            }
+        }
+
+        for (int cIdx = 0; cIdx < candCount && n < VR_PHYS_MAX_CONTACT_PRIMS; cIdx++) {
+            CollisionPoly* poly = cands[cIdx].poly;
+            const Vec3s* va = &colHeader->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIA)];
+            const Vec3s* vb = &colHeader->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIB)];
+            const Vec3s* vc = &colHeader->vtxList[COLPOLY_VTX_INDEX(poly->vIC)];
+            VrContactPrim& pr = prims[n++];
+            pr.type = VR_PHYS_PRIM_TRI;
+            pr.a[0] = va->x;
+            pr.a[1] = va->y;
+            pr.a[2] = va->z;
+            pr.b[0] = vb->x;
+            pr.b[1] = vb->y;
+            pr.b[2] = vb->z;
+            pr.c[0] = vc->x;
+            pr.c[1] = vc->y;
+            pr.c[2] = vc->z;
+            pr.radius = 0.0f;
+            // Surface sfx material (0xA wood, 0xB soft dirt, else hard stone) rides along so the
+            // impact handler can play the same sound the vanilla recoil would.
+            pr.id = PrimId(kPrimKindWall, (int)func_80041F10(&play->colCtx, poly, BGCHECK_SCENE));
+        }
+
+        sStickyCount = candCount < kMaxLevelTris ? candCount : kMaxLevelTris;
+        for (int cIdx = 0; cIdx < sStickyCount; cIdx++) {
+            sStickyPolys[cIdx] = cands[cIdx].poly;
+        }
+    }
+
+    // Dyna geometry (moving platforms, drawbridges) isn't in the static poly list — a few probe
+    // rays supplement it. Static hits dedup against the proximity set by poly pointer.
+    const float kFan = 0.45f; // ~26 degrees
+    const Vec3f upNudge = { 0.0f, 12.0f, 0.0f };
+    const Vec3f downReach = { 0.0f, -70.0f, 0.0f };
+    Vec3f probeFrom[5];
+    Vec3f probeTo[5];
+    probeFrom[0] = base;
+    probeTo[0] = vadd(base, vscale(bladeVec, 1.35f));
+    probeFrom[1] = base;
+    probeTo[1] = vadd(base, vscale(rotY(bladeVec, kFan), 1.35f));
+    probeFrom[2] = base;
+    probeTo[2] = vadd(base, vscale(rotY(bladeVec, -kFan), 1.35f));
+    probeFrom[3] = vadd(tip, upNudge);
+    probeTo[3] = vadd(tip, downReach);
+    probeFrom[4] = vadd(mid, upNudge);
+    probeTo[4] = vadd(mid, downReach);
+
+    CollisionPoly* seenPolys[5];
+    int seenCount = 0;
+    for (int i = 0; i < 5 && n < VR_PHYS_MAX_CONTACT_PRIMS; i++) {
+        Vec3f hitPos;
+        CollisionPoly* poly = NULL;
+        s32 bgId;
+        if (!BgCheck_EntityLineTest1(&play->colCtx, &probeFrom[i], &probeTo[i], &hitPos, &poly, true, true, false,
+                                     true, &bgId) ||
+            poly == NULL) {
+            continue;
+        }
+        bool dup = false;
+        for (int s = 0; s < seenCount; s++) {
+            if (seenPolys[s] == poly) {
+                dup = true;
+                break;
+            }
+        }
+        for (int cIdx = 0; cIdx < candCount && !dup; cIdx++) {
+            if (cands[cIdx].poly == poly) {
+                dup = true;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        seenPolys[seenCount++] = poly;
+
+        Vec3f verts[3];
+        CollisionPoly_GetVerticesByBgId(poly, bgId, &play->colCtx, verts);
+        VrContactPrim& pr = prims[n++];
+        pr.type = VR_PHYS_PRIM_TRI;
+        pr.a[0] = verts[0].x;
+        pr.a[1] = verts[0].y;
+        pr.a[2] = verts[0].z;
+        pr.b[0] = verts[1].x;
+        pr.b[1] = verts[1].y;
+        pr.b[2] = verts[1].z;
+        pr.c[0] = verts[2].x;
+        pr.c[1] = verts[2].y;
+        pr.c[2] = verts[2].z;
+        pr.radius = 0.0f;
+        pr.id = PrimId(kPrimKindWall, (int)func_80041F10(&play->colCtx, poly, bgId));
+    }
+
+    // Actor colliders, from this tick's AC registrations (populated: enemies updated before draw).
+    CollisionCheckContext* colChk = &play->colChkCtx;
+    for (int i = 0; i < colChk->colACCount && n < VR_PHYS_MAX_CONTACT_PRIMS; i++) {
+        Collider* col = colChk->colAC[i];
+        if (col == NULL || col->actor == NULL || col->actor == &player->actor) {
+            continue;
+        }
+        const bool hard = (col->acFlags & AC_HARD) != 0;
+        const bool enemyBody =
+            (col->actor->category == ACTORCAT_ENEMY) || (col->actor->category == ACTORCAT_BOSS);
+        if (!hard && !enemyBody) {
+            continue;
+        }
+        if (Math_Vec3f_DistXYZ(&col->actor->world.pos, &player->actor.world.pos) > 400.0f) {
+            continue;
+        }
+        const int primId = hard ? PrimId(kPrimKindHard, col->colType) : PrimId(kPrimKindFlesh, 0);
+        if (col->shape == COLSHAPE_CYLINDER) {
+            ColliderCylinder* cyl = (ColliderCylinder*)col;
+            if (cyl->dim.radius <= 0) {
+                continue;
+            }
+            VrContactPrim& pr = prims[n++];
+            pr.type = VR_PHYS_PRIM_CAPSULE;
+            pr.a[0] = (float)cyl->dim.pos.x;
+            pr.a[1] = (float)(cyl->dim.pos.y + cyl->dim.yShift);
+            pr.a[2] = (float)cyl->dim.pos.z;
+            pr.b[0] = pr.a[0];
+            pr.b[1] = pr.a[1] + (float)cyl->dim.height;
+            pr.b[2] = pr.a[2];
+            pr.radius = (float)cyl->dim.radius;
+            pr.id = primId;
+        } else if (col->shape == COLSHAPE_JNTSPH) {
+            ColliderJntSph* jntSph = (ColliderJntSph*)col;
+            for (int e = 0; e < jntSph->count && n < VR_PHYS_MAX_CONTACT_PRIMS; e++) {
+                ColliderJntSphElement* el = &jntSph->elements[e];
+                if (el->dim.worldSphere.radius <= 0) {
+                    continue;
+                }
+                VrContactPrim& pr = prims[n++];
+                pr.type = VR_PHYS_PRIM_SPHERE;
+                pr.a[0] = (float)el->dim.worldSphere.center.x;
+                pr.a[1] = (float)el->dim.worldSphere.center.y;
+                pr.a[2] = (float)el->dim.worldSphere.center.z;
+                pr.b[0] = pr.b[1] = pr.b[2] = 0.0f;
+                pr.radius = (float)el->dim.worldSphere.radius;
+                pr.id = primId;
+            }
+        }
+    }
+
+    VR_PhysSetContactPrims(prims, n);
+
+    // Snapshot for the debug overlay (drawn at OnPlayDrawEnd, same tick).
+    memcpy(sDebugPrims, prims, sizeof(VrContactPrim) * n);
+    sDebugPrimCount = n;
+}
+
+void EnsureQuads(PlayState* play, Player* player) {
+    if (sQuadsPlay == play) {
+        return;
+    }
+    for (int i = 0; i < kMaxQuads; i++) {
+        Collider_InitQuad(play, &sQuads[i]);
+        Collider_SetQuad(play, &sQuads[i], &player->actor, &sVrQuadInit);
+    }
+    sQuadsPlay = play;
+    sQuadsUsed = 0;
+    sTier = TIER_IDLE;
+    sHaveBladePrev = false;
+}
+
+// Reconstruct a world-space blade point at an older grip sample: local = the point expressed in
+// the reference (newest) grip frame, re-applied at the sample's pose.
+inline Vec3f AtSample(const VrHandSample& s, const Vec3f& local) {
+    const Q4 q = { s.quat[0], s.quat[1], s.quat[2], s.quat[3] };
+    const Vec3f p = { s.pos[0], s.pos[1], s.pos[2] };
+    return vadd(p, qrot(q, local));
+}
+
+void RegisterQuad(PlayState* play, uint32_t dmgFlags, const Vec3f& newBase, const Vec3f& newTip,
+                  const Vec3f& prevBase, const Vec3f& prevTip) {
+    if (sQuadsUsed >= kMaxQuads) {
+        return;
+    }
+    // Zero-motion frames register nothing (the vanilla exact-equality skip, with slop).
+    if (vdist(newTip, prevTip) + vdist(newBase, prevBase) < 0.1f) {
+        return;
+    }
+    ColliderQuad* quad = &sQuads[sQuadsUsed++];
+    quad->info.toucher.dmgFlags = dmgFlags;
+    quad->info.toucherFlags = TOUCH_ON | TOUCH_NEAREST;
+    // Vanilla vertex order (func_80090480): newBase, newTip, prevBase, prevTip.
+    Collider_SetQuadVertices(quad, const_cast<Vec3f*>(&newBase), const_cast<Vec3f*>(&newTip),
+                             const_cast<Vec3f*>(&prevBase), const_cast<Vec3f*>(&prevTip));
+    CollisionCheck_SetAT(play, &play->colChkCtx, &quad->base);
+}
+
+} // namespace
+
+extern "C" bool VrCombat_MeleeCovered(Player* player) {
+    if (player->actor.category != ACTORCAT_PLAYER) {
+        return false; // co-op partner keeps vanilla behavior
+    }
+    const s32 held = Player_GetMeleeWeaponHeld(player);
+    // 1 = Master, 2 = Kokiri, 3 = Biggoron/Giant's Knife (physical now, one-hand feel until the
+    // two-hand milestone gives it real weight), 4 = stick, 5 = hammer (both still vanilla).
+    return (held == 1) || (held == 2) || (held == 3);
+}
+
+extern "C" bool VrCombat_MeleeQuadsHit(void) {
+    if (sQuadsPlay == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < sQuadsUsed; i++) {
+        if (sQuads[i].base.atFlags & AT_HIT) {
+            return true;
+        }
+    }
+    return false;
+}
+
+extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
+    EnsureQuads(play, player);
+
+    // Blade geometry through the live (controller) matrix: ONE line from hilt to visual tip.
+    // The vanilla collider fattens this considerably (edge lines extended ~12 units past the tip
+    // with ~20 units of lateral spread) as animation-era forgiveness; here the collider is
+    // exactly the sword you see, with per-weapon length sliders. The cross points extrude the
+    // line sideways by the width slider — they form the stab quad and nothing else.
+    const float lenModel = BladeLengthModelUnits(player);
+    const float halfWidthModel = CVarGetFloat("gVrPhysBladeWidth", 4.0f) * 50.0f;
+    Vec3f tip0, base0, crossTipA, crossBaseA, crossTipB, crossBaseB;
+    {
+        Vec3f m = { lenModel, 400.0f, 0.0f };
+        Matrix_MultVec3f(&m, &tip0);
+        m = { 0.0f, 400.0f, 0.0f };
+        Matrix_MultVec3f(&m, &base0);
+        m = { lenModel, 400.0f, -halfWidthModel };
+        Matrix_MultVec3f(&m, &crossTipA);
+        m = { 0.0f, 400.0f, -halfWidthModel };
+        Matrix_MultVec3f(&m, &crossBaseA);
+        m = { lenModel, 400.0f, halfWidthModel };
+        Matrix_MultVec3f(&m, &crossTipB);
+        m = { 0.0f, 400.0f, halfWidthModel };
+        Matrix_MultVec3f(&m, &crossBaseB);
+    }
+
+    const int hand = SwordHand();
+    const VrCombat::TickPath& path = VrCombat::GetTickPath(hand);
+
+    float worldScale = VR_GetWorldScale();
+    if (worldScale < 1.0f) {
+        worldScale = 35.0f;
+    }
+
+    // ---- 1. Swing speed over the tick (m/s) ----
+    // Velocity of the blade's MIDPOINT, evaluated analytically per sample as v_hand + w x r from
+    // the runtime's FILTERED velocities. Three properties matter:
+    //  - tracked velocities never contain artificial locomotion, snap turns or camera-anchor
+    //    motion, so running or turning with the stick cannot read as a swing;
+    //  - no finite differencing of per-frame positions, so wrist tracking noise isn't amplified
+    //    down the blade's lever arm;
+    //  - the midpoint halves the lever a pure wrist-flick gets, and the hand-speed floor below
+    //    finishes the job: damaging swings have to come from the arm (GORN/Ancient Dungeon rule).
+    // The blade's grip-local geometry is extracted against the EFFECTIVE hand pose — the same
+    // (possibly simulated) pose whose matrix produced tips/bases. Extracting against the raw
+    // controller would corrupt the geometry the moment the virtual blade deflects on contact.
+    // The local vectors are frame-independent constants of the rigid blade, so applying them to
+    // raw hand samples below still reconstructs the player's INTENT blade for speed measurement.
+    float effPosArr[3];
+    float effQuatArr[4];
+    const bool haveEff = VR_GetHandPose(hand, effPosArr, effQuatArr);
+    const Q4 effInv = qconj({ effQuatArr[0], effQuatArr[1], effQuatArr[2], effQuatArr[3] });
+    const Vec3f effPos = { effPosArr[0], effPosArr[1], effPosArr[2] };
+    const Vec3f tipLocal0 = haveEff ? qrot(effInv, vsub(tip0, effPos)) : Vec3f{ 0.0f, 0.0f, 0.0f };
+    const Vec3f baseLocal0 = haveEff ? qrot(effInv, vsub(base0, effPos)) : Vec3f{ 0.0f, 0.0f, 0.0f };
+
+    sTickTipSpeed = 0.0f;
+    sTickHandSpeed = 0.0f;
+
+    if (haveEff && path.count >= 1) {
+        const Vec3f midLocal = vscale(vadd(tipLocal0, baseLocal0), 0.5f);
+
+        for (int i = 0; i < path.count; i++) {
+            const VrHandSample& s = path.samples[i];
+            const Q4 q = { s.quat[0], s.quat[1], s.quat[2], s.quat[3] };
+            const Vec3f rM = vscale(qrot(q, midLocal), 1.0f / worldScale); // hand->blade-mid, meters
+            const Vec3f v = { s.linVelMps[0] + s.angVelRps[1] * rM.z - s.angVelRps[2] * rM.y,
+                              s.linVelMps[1] + s.angVelRps[2] * rM.x - s.angVelRps[0] * rM.z,
+                              s.linVelMps[2] + s.angVelRps[0] * rM.y - s.angVelRps[1] * rM.x };
+            const float swing = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+            const float handSpd =
+                sqrtf(s.linVelMps[0] * s.linVelMps[0] + s.linVelMps[1] * s.linVelMps[1] +
+                      s.linVelMps[2] * s.linVelMps[2]);
+            if (swing > sTickTipSpeed) {
+                sTickTipSpeed = swing;
+            }
+            if (handSpd > sTickHandSpeed) {
+                sTickHandSpeed = handSpd;
+            }
+        }
+    } else {
+        // Sparse tick (hitch / hand just tracked): fall back to the hand's own speed.
+        float lin[3];
+        float ang[3];
+        if (VR_GetHandVelocity(hand, lin, ang)) {
+            sTickHandSpeed = sTickTipSpeed = sqrtf(lin[0] * lin[0] + lin[1] * lin[1] + lin[2] * lin[2]);
+        }
+    }
+
+    // ---- 2. Tier hysteresis ----
+    const float armSpeed = CVarGetFloat("gVrPhysArmSpeed", 1.2f);
+    const float hitSpeed = CVarGetFloat("gVrPhysHitSpeed", 2.2f);
+    const float heavySpeed = CVarGetFloat("gVrPhysHeavySpeed", 4.0f);
+    const float reArmSpeed = CVarGetFloat("gVrPhysReArmSpeed", 0.8f);
+    // Damage additionally requires the HAND itself to move: a stationary-wrist flick can spin
+    // the blade fast but never hurts anything (it still arms — trail/SFX/AI windup feedback).
+    const float minHandSpeed = CVarGetFloat("gVrPhysMinHandSpeed", 0.6f);
+    const bool handCommitted = sTickHandSpeed >= minHandSpeed;
+
+    if (sTier == TIER_IDLE) {
+        if (sTickTipSpeed >= hitSpeed && handCommitted) {
+            sTier = TIER_HOT;
+        } else if (sTickTipSpeed >= armSpeed) {
+            sTier = TIER_ARMED;
+        }
+    } else {
+        if (sTier == TIER_ARMED && sTickTipSpeed >= hitSpeed && handCommitted) {
+            sTier = TIER_HOT;
+        }
+        if (sTickTipSpeed < reArmSpeed) {
+            sTier = TIER_IDLE;
+        }
+    }
+
+    // ---- 2b. Held-object sim: the virtual blade with inertia + contact ----
+    const bool inertiaOn = CVarGetInteger("gVrPhysBladeInertia", 1) != 0;
+    if (inertiaOn && haveEff) {
+        VrHeldObjectDesc desc = {};
+        desc.primaryHand = hand;
+        desc.secondaryHand = -1;
+        desc.linFreqHz = CVarGetFloat("gVrPhysSword1HFreq", 14.0f);
+        desc.linZeta = CVarGetFloat("gVrPhysSword1HZeta", 1.0f);
+        desc.angZeta = desc.linZeta;
+        desc.gripLocalRootM[0] = baseLocal0.x / worldScale;
+        desc.gripLocalRootM[1] = baseLocal0.y / worldScale;
+        desc.gripLocalRootM[2] = baseLocal0.z / worldScale;
+        desc.gripLocalTipM[0] = tipLocal0.x / worldScale;
+        desc.gripLocalTipM[1] = tipLocal0.y / worldScale;
+        desc.gripLocalTipM[2] = tipLocal0.z / worldScale;
+        desc.contactEnabled = 1;
+        desc.restitution = CVarGetFloat("gVrPhysBounceRestitution", 0.25f);
+        // Low default friction: steel skates along stone/flesh instead of planting.
+        desc.friction = CVarGetFloat("gVrPhysBladeFriction", 0.15f);
+        // Contact distances are authored in GAME UNITS (what the blade-length sliders use) and
+        // converted to meters here, so they mean the same thing at any world scale.
+        desc.bladeRadiusM = CVarGetFloat("gVrPhysBladeThickness", 0.4f) / worldScale;
+        desc.speculativeM = CVarGetFloat("gVrPhysContactReach", 1.6f) / worldScale;
+        desc.touchToleranceM = CVarGetFloat("gVrPhysTouchTolerance", 0.3f) / worldScale;
+        desc.maxAngAccel = CVarGetFloat("gVrPhysMaxAngAccel", 3000.0f);
+        desc.angFreqHz = CVarGetFloat("gVrPhysSwordAngFreq", 30.0f);
+        desc.maxAccelMps2 = CVarGetFloat("gVrPhysMaxAccel", 400.0f);
+        VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, &desc);
+        PushContactPrims(play, player, base0, tip0);
+    } else {
+        VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, NULL);
+        VR_PhysSetContactPrims(NULL, 0);
+    }
+
+    // ---- 3. Mirror the melee state for everyone who reads it ----
+    // Enemy AI reacts to windups via meleeWeaponState (Stalfos/Gerudo/Wolfos/Dark Link...), and
+    // the Ganondorf final blow requires it nonzero. The animation id is pinned to a plain slash
+    // so spin-only AI branches stay cold. The setter shim plays the swing SFX on the 0->nonzero
+    // edge, exactly like a vanilla attack.
+    player->meleeWeaponAnimation = PLAYER_MWA_FORWARD_SLASH_1H;
+    if (sTier == TIER_IDLE) {
+        player->meleeWeaponState = 0;
+    } else {
+        VrCombat_SetMeleeWeaponState(player, (sTier == TIER_HOT) ? 1 : -1);
+    }
+
+    // ---- 4. Sword trail ----
+    if (sTier != TIER_IDLE) {
+        if (func_80090480(play, NULL, &player->meleeWeaponInfo[0], &tip0, &base0) &&
+            !(player->stateFlags1 & PLAYER_STATE1_SHIELDING) &&
+            !CVarGetInteger(CVAR_ENHANCEMENT("DisableLinkSwordTrail"), 0)) {
+            EffectBlure_AddVertex((EffectBlure*)Effect_GetByIndex(player->meleeWeaponEffectIndex),
+                                  &player->meleeWeaponInfo[0].tip, &player->meleeWeaponInfo[0].base);
+        }
+    } else {
+        player->meleeWeaponInfo[0].active = 0;
+        player->meleeWeaponInfo[1].active = 0;
+        player->meleeWeaponInfo[2].active = 0;
+    }
+
+    // ---- 5. Swept damage quads while HOT ----
+    // With the sim active the quads come from the SIMULATED blade's path — a blade stopped at a
+    // wall registers nothing along the hand's ghost trajectory. Without the sim (inertia off),
+    // the intent blade is reconstructed along the raw hand path as before.
+    sQuadsUsed = 0;
+
+    // Physical strikes recorded last tick become damage now: a small quad poked through the
+    // surface at each impact point, hitting exactly the struck target via TOUCH_NEAREST.
+    for (int i = 0; i < sPendingStrikeCount && sQuadsUsed < kMaxQuads; i++) {
+        const PendingStrike& st = sPendingStrikes[i];
+        const Vec3f up = (st.normal.y > 0.9f || st.normal.y < -0.9f) ? Vec3f{ 1.0f, 0.0f, 0.0f }
+                                                                     : Vec3f{ 0.0f, 1.0f, 0.0f };
+        const Vec3f t1 = vnorm(vcross(st.normal, up));
+        const Vec3f t2 = vcross(st.normal, t1);
+        const Vec3f c = vsub(st.pos, vscale(st.normal, 6.0f)); // pushed inside the surface
+        const Vec3f e1 = vscale(t1, 9.0f);
+        const Vec3f e2 = vscale(t2, 9.0f);
+        RegisterQuad(play, st.dmgFlags, vsub(vsub(c, e1), e2), vsub(vadd(c, e1), e2), vadd(vsub(c, e1), e2),
+                     vadd(vadd(c, e1), e2));
+    }
+    sPendingStrikeCount = 0;
+
+    VrBladeSample bladePath[16];
+    const int bladeN = inertiaOn ? VR_PhysGetBladePath(VR_PHYS_SLOT_WEAPON, bladePath, 16) : 0;
+    if (sTier == TIER_HOT) {
+        const s32 held = Player_GetMeleeWeaponHeld(player);
+        const int row = Player_HoldsBrokenKnife(player) ? 1 : (int)held - 1;
+        const uint32_t dmgFlags = kDmgFlags[(row < 0 || row > 2) ? 1 : row][sTickTipSpeed >= heavySpeed ? 1 : 0];
+
+        if (bladeN >= 2) {
+            // Sweep quads between consecutive sim blade lines (evenly picked, max 5)...
+            int segments = bladeN - 1;
+            if (segments > kMaxQuads - 1) {
+                segments = kMaxQuads - 1;
+            }
+            int prevIdx = 0;
+            for (int k = 1; k <= segments; k++) {
+                const int idx = (k * (bladeN - 1)) / segments;
+                if (idx <= prevIdx) {
+                    continue;
+                }
+                const Vec3f rootA = { bladePath[prevIdx].root[0], bladePath[prevIdx].root[1],
+                                      bladePath[prevIdx].root[2] };
+                const Vec3f tipA = { bladePath[prevIdx].tip[0], bladePath[prevIdx].tip[1],
+                                     bladePath[prevIdx].tip[2] };
+                const Vec3f rootB = { bladePath[idx].root[0], bladePath[idx].root[1], bladePath[idx].root[2] };
+                const Vec3f tipB = { bladePath[idx].tip[0], bladePath[idx].tip[1], bladePath[idx].tip[2] };
+                RegisterQuad(play, dmgFlags, rootB, tipB, rootA, tipA);
+                prevIdx = idx;
+            }
+            // ...plus the width cross-section at the current pose, which is what gives a
+            // straight STAB a quad with real area.
+            RegisterQuad(play, dmgFlags, crossBaseA, crossTipA, crossBaseB, crossTipB);
+        } else if (!inertiaOn && haveEff && path.count >= 2) {
+            // The intent blade (single line) re-applied along the tick's hand samples.
+            int segments = CVarGetInteger("gVrPhysSubQuads", 3);
+            if (segments < 1) {
+                segments = 1;
+            }
+            if (segments > 5) {
+                segments = 5;
+            }
+            if (segments > path.count - 1) {
+                segments = path.count - 1;
+            }
+
+            int prevIdx = 0;
+            for (int k = 1; k <= segments; k++) {
+                const int idx = (k * (path.count - 1)) / segments;
+                if (idx <= prevIdx) {
+                    continue;
+                }
+                const VrHandSample& a = path.samples[prevIdx];
+                const VrHandSample& b = path.samples[idx];
+                const Vec3f tipA = AtSample(a, tipLocal0);
+                const Vec3f baseA = AtSample(a, baseLocal0);
+                const Vec3f tipB = AtSample(b, tipLocal0);
+                const Vec3f baseB = AtSample(b, baseLocal0);
+                RegisterQuad(play, dmgFlags, baseB, tipB, baseA, tipA);
+                prevIdx = idx;
+            }
+            RegisterQuad(play, dmgFlags, crossBaseA, crossTipA, crossBaseB, crossTipB);
+        } else if (sHaveBladePrev) {
+            // No usable path this tick: one sweep from last frame's blade, plus the stab quad.
+            RegisterQuad(play, dmgFlags, base0, tip0, sPrevBase[0], sPrevTip[0]);
+            RegisterQuad(play, dmgFlags, crossBaseA, crossTipA, crossBaseB, crossTipB);
+        }
+    }
+
+    // Latch the current blade line for the sparse-tick fallback.
+    sPrevTip[0] = tip0;
+    sPrevBase[0] = base0;
+    sHaveBladePrev = true;
+}
+
+namespace VrCombat {
+
+void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
+    // Weapon switched to something physical combat doesn't cover: release the sim slot so the
+    // hand pose reverts to the raw controller (the draw-time feed only runs for covered weapons).
+    if (!VrCombat_MeleeCovered(player)) {
+        VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, NULL);
+        VR_PhysSetContactPrims(NULL, 0);
+    }
+
+    // Contact events from the sim: impact SFX + sparks at the contact point (the matching
+    // haptics already fired VR-side with zero latency).
+    VrContactEvent events[8];
+    const int eventCount = VR_PhysDrainEvents(events, 8);
+    for (int i = 0; i < eventCount; i++) {
+        if (events[i].type != VR_PHYS_EV_CONTACT_BEGIN || events[i].slot != VR_PHYS_SLOT_WEAPON) {
+            continue;
+        }
+        Vec3f pos = { events[i].pos[0], events[i].pos[1], events[i].pos[2] };
+
+        // Material-correct impact feedback, mirroring the vanilla sword-recoil path
+        // (z_player.c func_80842DF4's wall branch): surface material picks wood particles/sound,
+        // soft-dirt thud or hard stone clank; hard colliders read their colType; enemy flesh is
+        // silent here (the strike pipeline below produces the vanilla hit sound and effects).
+        // Faint brushes (slow approach) stay quiet.
+        const int kind = PrimKind(events[i].primId);
+        const int detail = PrimDetail(events[i].primId);
+        if (events[i].impactMps > 0.4f) {
+            if (kind == kPrimKindWall) {
+                if (detail == 0xA) {
+                    CollisionCheck_SpawnShieldParticlesWood(play, &pos, &player->actor.projectedPos);
+                } else {
+                    CollisionCheck_SpawnShieldParticles(play, &pos);
+                    Player_PlaySfx(&player->actor,
+                                   detail == 0xB ? NA_SE_IT_WALL_HIT_SOFT : NA_SE_IT_WALL_HIT_HARD);
+                }
+            } else if (kind == kPrimKindHard) {
+                if (detail == COLTYPE_WOOD || detail == COLTYPE_TREE) {
+                    CollisionCheck_SpawnShieldParticlesWood(play, &pos, &player->actor.projectedPos);
+                } else {
+                    // Metal/hard armor: the metal-shield spark burst with its own clang.
+                    CollisionCheck_SpawnShieldParticlesMetalSound(play, &pos, &player->actor.projectedPos);
+                }
+            }
+        }
+
+        // A damaging swing that physically struck something: queue a strike for the next draw.
+        // Damage class from the swing that carried the impact.
+        if (sTier == TIER_HOT && sPendingStrikeCount < 4) {
+            const s32 held = Player_GetMeleeWeaponHeld(player);
+            const int row = Player_HoldsBrokenKnife(player) ? 1 : (int)held - 1;
+            const float heavySpeed = CVarGetFloat("gVrPhysHeavySpeed", 4.0f);
+            PendingStrike& st = sPendingStrikes[sPendingStrikeCount++];
+            st.pos = pos;
+            st.normal = { events[i].normal[0], events[i].normal[1], events[i].normal[2] };
+            st.dmgFlags = kDmgFlags[(row < 0 || row > 2) ? 1 : row][sTickTipSpeed >= heavySpeed ? 1 : 0];
+        }
+    }
+
+    if (sQuadsPlay != play) {
+        return;
+    }
+    // Read back last tick's quad results (the AT pass ran at the top of this tick).
+    bool hit = false;
+    for (int i = 0; i < sQuadsUsed; i++) {
+        if (sQuads[i].base.atFlags & AT_HIT) {
+            hit = true;
+        }
+    }
+    if (hit) {
+        VR_TriggerHaptic(SwordHand(), 0.8f, 0.0f, 60.0f);
+        if (sTier == TIER_HOT) {
+            sTier = TIER_ARMED; // one strike per swing: re-cross the hit speed to strike again
+        }
+    }
+    for (int i = 0; i < sQuadsUsed; i++) {
+        Collider_ResetQuadAT(play, &sQuads[i].base);
+    }
+    sQuadsUsed = 0;
+}
+
+int Swing_GetDebugContactPrims(VrContactPrim* out, int maxPrims) {
+    const int n = sDebugPrimCount < maxPrims ? sDebugPrimCount : maxPrims;
+    memcpy(out, sDebugPrims, sizeof(VrContactPrim) * n);
+    return n;
+}
+
+int Swing_GetDebugQuads(float* outVerts12PerQuad, int maxQuads) {
+    const int n = sQuadsUsed < maxQuads ? sQuadsUsed : maxQuads;
+    for (int i = 0; i < n; i++) {
+        for (int v = 0; v < 4; v++) {
+            outVerts12PerQuad[i * 12 + v * 3 + 0] = sQuads[i].dim.quad[v].x;
+            outVerts12PerQuad[i * 12 + v * 3 + 1] = sQuads[i].dim.quad[v].y;
+            outVerts12PerQuad[i * 12 + v * 3 + 2] = sQuads[i].dim.quad[v].z;
+        }
+    }
+    return n;
+}
+
+void Swing_Deactivate(PlayState* play, Player* player) {
+    // Falling edge of VrCombat_Active(): hand the melee state back to vanilla cleanly.
+    VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, NULL);
+    VR_PhysSetContactPrims(NULL, 0);
+    sTier = TIER_IDLE;
+    sHaveBladePrev = false;
+    sPendingStrikeCount = 0;
+    player->meleeWeaponState = 0;
+    player->meleeWeaponInfo[0].active = 0;
+    player->meleeWeaponInfo[1].active = 0;
+    player->meleeWeaponInfo[2].active = 0;
+    if (sQuadsPlay == play) {
+        for (int i = 0; i < kMaxQuads; i++) {
+            Collider_ResetQuadAT(play, &sQuads[i].base);
+        }
+    }
+    sQuadsUsed = 0;
+}
+
+} // namespace VrCombat

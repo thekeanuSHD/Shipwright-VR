@@ -1,6 +1,9 @@
 #include "SohMenu.h"
 #include <libultraship/bridge/consolevariablebridge.h>
 #include <imgui.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vr_interface.h>
 #include <fast/vr_openxr.h>
 
@@ -208,6 +211,71 @@ static void VrPerformanceReadout(WidgetInfo& info) {
                            "same thread, so it comes out of the render budget)");
 }
 
+// Live hand-speed readout for tuning physical combat: current speed plus a slowly-bleeding peak
+// per hand, in physical meters/second — the unit every swing threshold is tuned in, independent
+// of world scale and Link's age. Runs at menu (render) rate, so it shows every XR frame's sample.
+static void VrPhysCombatReadout(WidgetInfo& info) {
+    if (!VR_IsInitialized()) {
+        ImGui::TextUnformatted("Not in VR.");
+        return;
+    }
+    static float sPeak[2] = { 0.0f, 0.0f };
+    const float dt = ImGui::GetIO().DeltaTime;
+    static const char* sNames[2] = { "Left ", "Right" };
+    for (int hand = 0; hand < 2; hand++) {
+        float lin[3];
+        float ang[3];
+        float speed = 0.0f;
+        if (VR_GetHandVelocity(hand, lin, ang)) {
+            speed = sqrtf(lin[0] * lin[0] + lin[1] * lin[1] + lin[2] * lin[2]);
+        }
+        sPeak[hand] = fmaxf(speed, sPeak[hand] - 2.0f * dt); // bleed 2 m/s per second
+        ImGui::Text("%s hand  %5.2f m/s   peak %5.2f m/s", sNames[hand], speed, sPeak[hand]);
+    }
+    ImGui::TextUnformatted("Swing a controller and watch the numbers move.");
+}
+
+// Physics flight recorder. The checkbox arms a ring buffer holding the most recent ~20 s of sim
+// steps; switching it off writes the capture to CSV next to the executable. Recording keeps the
+// LAST window rather than the first, so the workflow is: enable, go reproduce the problem, then
+// disable — whatever just happened is in the file.
+static void VrPhysLogControl(WidgetInfo& info) {
+    static bool sWasLogging = false;
+    static char sStatus[512] = "";
+
+    const bool wantLog = CVarGetInteger("gVrPhysLog", 0) != 0;
+    if (wantLog != sWasLogging) {
+        sWasLogging = wantLog;
+        if (wantLog) {
+            VR_PhysLogSetEnabled(true);
+            snprintf(sStatus, sizeof(sStatus), "Recording...");
+        } else {
+            VR_PhysLogSetEnabled(false);
+            const char* path = "vr_phys_log.csv";
+            const int32_t n = VR_PhysLogWrite(path);
+            if (n > 0) {
+                char abs[MAX_PATH] = "";
+                if (_fullpath(abs, path, sizeof(abs)) == nullptr) {
+                    snprintf(abs, sizeof(abs), "%s", path);
+                }
+                snprintf(sStatus, sizeof(sStatus), "Wrote %d samples to:\n%s", n, abs);
+            } else if (n == 0) {
+                snprintf(sStatus, sizeof(sStatus), "Nothing captured (was the sword in hand, "
+                                                   "with Physical Combat + blade inertia on?)");
+            } else {
+                snprintf(sStatus, sizeof(sStatus), "Could not open the log file for writing.");
+            }
+        }
+    }
+
+    if (wantLog) {
+        ImGui::Text("Recording: %d samples buffered", VR_PhysLogCount());
+        ImGui::TextUnformatted("Reproduce the problem, then turn this off to write the file.");
+    } else if (sStatus[0] != '\0') {
+        ImGui::TextUnformatted(sStatus);
+    }
+}
+
 void SohMenu::AddMenuVRSettings() {
     AddMenuEntry("VR Settings", CVAR_SETTING("Menu.VRSettingsSidebarSection"));
 
@@ -378,6 +446,231 @@ void SohMenu::AddMenuVRSettings() {
             "game. Off by default in VR: the bars just float on the head-locked overlay and "
             "shrink your view. Flat-screen play is unaffected by this setting (see Enhancements "
             "> Graphics for the flat equivalent)."));
+
+    // ----------------------------------------------------------- Physical Combat
+    AddSidebarEntry("VR Settings", "Physical Combat", 1);
+    WidgetPath physPath = { "VR Settings", "Physical Combat", SECTION_COLUMN_1 };
+
+    AddWidget(physPath, "Physical Combat (Experimental)", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrPhysCombat")
+        .Options(CheckboxOptions().Tooltip(
+            "Physics-driven combat: swing the sword yourself (swing speed decides the hit), "
+            "block by physically holding the shield up, grab pots with both hands, draw the bow "
+            "for real. Replaces button combat only in VR first person; cutscenes, minigames and "
+            "flat-screen play stay stock. Currently a foundations preview: this enables the "
+            "underlying motion tracking - the combat changes themselves arrive milestone by "
+            "milestone."));
+    AddWidget(physPath, "Debug Overlay", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrPhysCombatDebug")
+        .Options(CheckboxOptions().Tooltip(
+            "Draw hand velocity arrows and the per-tick motion path in the world, plus the live "
+            "speed readout below. Arrow color previews the swing tiers: green = too slow to "
+            "count, yellow = normal hit, red = strong hit."));
+
+    AddWidget(physPath, "Sword Swing Speeds", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "Arm Swing At: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysArmSpeed")
+        .Options(FloatSliderOptions()
+                     .Min(0.3f)
+                     .Max(6.0f)
+                     .DefaultValue(1.2f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Blade tip speed (real meters/second) where a swing starts counting: "
+                              "the trail appears, the swing sound plays, and enemies begin their "
+                              "guard/dodge reactions. Below this the sword is inert."));
+    AddWidget(physPath, "Hit At: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysHitSpeed")
+        .Options(FloatSliderOptions()
+                     .Min(0.5f)
+                     .Max(10.0f)
+                     .DefaultValue(2.2f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Tip speed where the blade actually damages what it sweeps through, "
+                              "at the weapon's normal slash strength."));
+    AddWidget(physPath, "Strong Hit At: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysHeavySpeed")
+        .Options(FloatSliderOptions()
+                     .Min(1.0f)
+                     .Max(16.0f)
+                     .DefaultValue(4.0f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Tip speed for a committed swing: damage steps up to the weapon's "
+                              "jump-slash class (double against most enemies)."));
+    AddWidget(physPath, "Re-Arm Below: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysReArmSpeed")
+        .Options(FloatSliderOptions()
+                     .Min(0.1f)
+                     .Max(4.0f)
+                     .DefaultValue(0.8f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("A swing ends (and the sword can strike again) once the tip slows "
+                              "below this. One strike lands per swing; follow-through and wind-up "
+                              "back up naturally re-arm you."));
+    AddWidget(physPath, "Min Hand Speed To Damage: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysMinHandSpeed")
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(4.0f)
+                     .DefaultValue(0.6f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Anti-wiggle: the hand itself must move at least this fast for a "
+                              "swing to deal damage. Pure wrist flicks spin the blade quickly but "
+                              "shouldn't cut - real swings come from the arm. 0 disables."));
+
+    AddWidget(physPath, "Blade Collider", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "Kokiri Sword Length: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeLenKokiri")
+        .Options(FloatSliderOptions()
+                     .Min(10.0f)
+                     .Max(60.0f)
+                     .DefaultValue(30.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("Blade collider length for the Kokiri Sword (game units, from the "
+                              "hilt). Default matches the visible blade. Unlike the base game, the "
+                              "collider is exactly one blade line - no invisible extra reach."));
+    AddWidget(physPath, "Master Sword Length: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeLenMaster")
+        .Options(FloatSliderOptions()
+                     .Min(10.0f)
+                     .Max(70.0f)
+                     .DefaultValue(40.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("Blade collider length for the Master Sword (game units). Default "
+                              "matches the visible blade."));
+    AddWidget(physPath, "Biggoron Sword Length: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeLenBiggoron")
+        .Options(FloatSliderOptions()
+                     .Min(20.0f)
+                     .Max(90.0f)
+                     .DefaultValue(55.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("Blade collider length for the Biggoron Sword / Giant's Knife (game "
+                              "units). Default matches the visible blade. Swings one-handed for "
+                              "now; real two-handed weight comes in a later update."));
+    AddWidget(physPath, "Blade Width: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeWidth")
+        .Options(FloatSliderOptions()
+                     .Min(1.0f)
+                     .Max(12.0f)
+                     .DefaultValue(4.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("Width of the blade's stab cross-section (game units). Only matters "
+                              "for straight thrusts - slashes get their hit area from the sweep "
+                              "itself."));
+
+    AddWidget(physPath, "Blade Physics", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "Blade Inertia & Collision", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrPhysBladeInertia")
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "The sword becomes a simulated object: it follows your hand on a stiff spring, "
+            "STOPS and bounces on walls, armor and enemy shields (with impact buzz and sparks) "
+            "while your real hand keeps going, and springs back as you pull away. Swings below "
+            "damage speed also bounce off enemies instead of passing through. Off = the blade "
+            "is glued to your hand and passes through everything (damage rules unchanged)."));
+    AddWidget(physPath, "Sword Snappiness: %.0f Hz", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysSword1HFreq")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(4.0f)
+                     .Max(30.0f)
+                     .DefaultValue(14.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("How stiffly the virtual blade tracks your hand. High = near-1:1 "
+                              "and responsive (light sword); low = floaty and heavy. Two-handed "
+                              "weapons get their own weight in a later update."));
+    AddWidget(physPath, "Sword Rotation Snappiness: %.0f Hz", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysSwordAngFreq")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(5.0f)
+                     .Max(60.0f)
+                     .DefaultValue(30.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("How fast the blade's ANGLE follows your wrist. Raise this if the "
+                              "sword lags behind during quick rotations; lower it for a heavier, "
+                              "slower-turning weapon."));
+    AddWidget(physPath, "Contact Reach: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysContactReach")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.2f)
+                     .Max(6.0f)
+                     .DefaultValue(1.6f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("How far ahead (game units) surfaces start pushing back on the "
+                              "blade. This is what keeps contact stable instead of letting the "
+                              "blade sink in and snap out - too low brings back the shaking, too "
+                              "high makes the sword stop short of things."));
+    AddWidget(physPath, "Blade Thickness: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeThickness")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(4.0f)
+                     .DefaultValue(0.4f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Collision thickness of the blade (game units) - how far the steel "
+                              "rests off a surface it is pressed against. Lower = the blade "
+                              "visually touches walls more closely."));
+    AddWidget(physPath, "Impact Tolerance: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysTouchTolerance")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.05f)
+                     .Max(3.0f)
+                     .DefaultValue(0.3f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("How close (game units) counts as a real hit for impact sounds, "
+                              "sparks and rumble. Because the blade is stopped exactly AT "
+                              "surfaces rather than inside them, a little tolerance is needed or "
+                              "impacts rarely register. Raise if hits feel like they get missed."));
+    AddWidget(physPath, "Blade Bounce: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBounceRestitution")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(1.0f)
+                     .DefaultValue(0.25f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("How much the blade rebounds off surfaces it can't cut. 0 = dead "
+                              "stop and slide, 1 = full elastic bounce."));
+
+    AddWidget(physPath, "Diagnostics", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "Record Physics Log", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrPhysLog")
+        .Options(CheckboxOptions().Tooltip(
+            "Capture every physics step of the held weapon (hand target, the pose the spring "
+            "produced, the pose after collision, every contact point/normal/depth, and a "
+            "fingerprint of the collision geometry in play). Keeps the most recent ~20 seconds. "
+            "Turn it ON, go reproduce the problem, then turn it OFF - the capture is written to "
+            "vr_phys_log.csv next to the game executable."));
+    AddWidget(physPath, "VrPhysLogControl", WIDGET_CUSTOM).CustomFunction(VrPhysLogControl).HideInSearch(true);
+
+    AddWidget(physPath, "Haptics", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "Test Left Haptic", WIDGET_BUTTON)
+        .Options(ButtonOptions().Tooltip("Buzz the left controller for 0.1 s."))
+        .Callback([](WidgetInfo& info) { VR_TriggerHaptic(0, 0.8f, 0.0f, 100.0f); });
+    AddWidget(physPath, "Test Right Haptic", WIDGET_BUTTON)
+        .Options(ButtonOptions().Tooltip("Buzz the right controller for 0.1 s."))
+        .Callback([](WidgetInfo& info) { VR_TriggerHaptic(1, 0.8f, 0.0f, 100.0f); });
+
+    AddWidget(physPath, "Live Hand Speed", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "VrPhysCombatReadout", WIDGET_CUSTOM).CustomFunction(VrPhysCombatReadout).HideInSearch(true);
 
     // --------------------------------------------------------------- HUD & Menus
     AddSidebarEntry("VR Settings", "HUD & Menus", 1);

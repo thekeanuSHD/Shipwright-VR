@@ -12,6 +12,7 @@
 #include "soh/ResourceManagerHelpers.h"
 
 #include <vr_interface.h>
+#include "soh/Enhancements/vr-combat/VrCombat.h"
 
 #include <stdlib.h>
 
@@ -1943,6 +1944,19 @@ void Player_PostLimbDrawGameplay(PlayState* play, s32 limbIndex, Gfx** dList, Ve
             gSPDisplayList(POLY_OPA_DISP++, gLinkChildLinkDekuStickDL);
 
             CLOSE_DISPS(play->state.gfxCtx);
+        } else if ((this->actor.scale.y >= 0.0f) && VrCombat_Active() && VrCombat_MeleeCovered(this)) {
+            // SOH [VR] Physical combat: blade collision comes from the real swing path, velocity-
+            // gated, instead of attack-animation state. The hand limb matrix on the stack here IS
+            // the controller pose; VrCombat_FeedMelee builds its own blade geometry through it
+            // (per-weapon length CVars), measures swing speed over this tick's motion, mirrors
+            // meleeWeaponState for enemy AI, feeds the trail, and registers swept AT quads only
+            // while the swing is fast enough. Only the trail's visual type is set here.
+            if (!Player_HoldsBrokenKnife(this)) {
+                EffectBlure_ChangeType(Effect_GetByIndex(this->meleeWeaponEffectIndex),
+                                       sSwordTypes[Player_GetMeleeWeaponHeld(this)]);
+            }
+
+            VrCombat_FeedMelee(play, this);
         } else if ((this->actor.scale.y >= 0.0f) && (this->meleeWeaponState != 0)) {
             Vec3f spE4[3];
 

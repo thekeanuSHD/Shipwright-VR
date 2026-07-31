@@ -27,6 +27,7 @@
 #include "soh/Enhancements/enhancementTypes.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
+#include "soh/Enhancements/vr-combat/VrCombat.h"
 #include "soh/Enhancements/randomizer/randomizer_entrance.h"
 #include "soh/Enhancements/randomizer/randomizer_grotto.h"
 #include "soh/frame_interpolation.h"
@@ -2395,6 +2396,13 @@ void func_80833A20(Player* this, s32 newMeleeWeaponState) {
     }
 
     this->meleeWeaponState = newMeleeWeaponState;
+}
+
+// SOH [VR] Physical combat drives meleeWeaponState from real hand motion (velocity-gated swings);
+// this shim exposes the file-internal setter so the module keeps the vanilla swing SFX / voice /
+// stat behavior on the 0 -> nonzero edge.
+void VrCombat_SetMeleeWeaponState(Player* this, int32_t newState) {
+    func_80833A20(this, newState);
 }
 
 /**
@@ -4875,7 +4883,10 @@ s32 func_808382DC(Player* this, PlayState* play) {
 
             if ((this->unk_A87 != 0) || (this->invincibilityTimer > 0) || (this->stateFlags1 & PLAYER_STATE1_DAMAGED) ||
                 (this->csAction != 0) || (this->meleeWeaponQuads[0].base.atFlags & AT_HIT) ||
-                (this->meleeWeaponQuads[1].base.atFlags & AT_HIT)) {
+                (this->meleeWeaponQuads[1].base.atFlags & AT_HIT) ||
+                // SOH [VR] Physical combat registers its own melee quads; landing a physical hit
+                // cancels incoming damage this frame exactly like a vanilla trade.
+                VrCombat_MeleeQuadsHit()) {
                 return 0;
             }
 
@@ -6319,6 +6330,14 @@ void func_8083BA90(PlayState* play, Player* this, s32 arg2, f32 xzVelocity, f32 
 }
 
 s32 func_8083BB20(Player* this) {
+    // SOH [VR] Physical combat: for covered weapons, button attacks are replaced by real swings.
+    // Every B attack (and with it combo chains, root motion and the stab lunge) originates from
+    // this check, so suppressing it here retires the whole authored-attack state machine while
+    // the mode is active. Uncovered weapons (stick/hammer, for now) keep vanilla attacks.
+    if (VrCombat_Active() && VrCombat_MeleeCovered(this)) {
+        return 0;
+    }
+
     if (!(this->stateFlags1 & PLAYER_STATE1_SHIELDING) && (Player_GetMeleeWeaponHeld(this) != 0)) {
         if (sUseHeldItem ||
             ((this->actor.category != ACTORCAT_PLAYER) && CHECK_BTN_ALL(sControlInput->press.button, BTN_B))) {
@@ -6503,6 +6522,14 @@ s32 Player_ActionHandler_11(Player* this, PlayState* play) {
     LinkAnimationHeader* anim;
     f32 frame;
 
+    // SOH [VR] Physical combat: never enter the crouch shield stance — it locks movement (and
+    // its entry clears the melee state mid-swing). The grip button doubles as R on the default
+    // bindings, so every firm squeeze during a swing was crouching Link. Physical shield
+    // blocking arrives with its own milestone; the Z-target upper-body shield path still works.
+    if (VrCombat_Active()) {
+        return 0;
+    }
+
     if ((play->shootingGalleryStatus == 0) && (this->currentShield != PLAYER_SHIELD_NONE) &&
         CHECK_BTN_ALL(sControlInput->cur.button, BTN_R) &&
         (Player_IsChildWithHylianShield(this) ||
@@ -6577,6 +6604,12 @@ void func_8083C50C(Player* this) {
 }
 
 s32 Player_ActionHandler_8(Player* this, PlayState* play) {
+    // SOH [VR] Physical combat: no button-held spin charge for covered weapons (the spin attack
+    // returns later as a motion gesture).
+    if (VrCombat_Active() && VrCombat_MeleeCovered(this)) {
+        return 0;
+    }
+
     if (CHECK_BTN_ALL(sControlInput->cur.button, BTN_B)) {
         if (!(this->stateFlags1 & PLAYER_STATE1_SHIELDING) && (Player_GetMeleeWeaponHeld(this) != 0) &&
             (this->unk_844 == 1) && (this->heldItemAction != PLAYER_IA_DEKU_STICK)) {
