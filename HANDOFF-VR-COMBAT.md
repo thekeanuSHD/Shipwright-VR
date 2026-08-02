@@ -33,7 +33,7 @@ animation-driven enemies), GORN/Blade & Sorcery (limb manipulation).
 ### Layer 0 — libultraship sim (`libultraship/src/fast/vr_physics.cpp`, headset rate)
 
 Self-contained held-object simulation in RAW tracking space (meters), stepped per XR frame
-from `vr_begin_frame`. C ABI in `include/vr_interface.h`, **interface version 11** (asserted
+from `vr_begin_frame`. C ABI in `include/vr_interface.h`, **interface version 12** (asserted
 game-side at init; bump on any struct change).
 
 - **Position-based solver, not impulses**: a spring-damper (implicit/backward-Euler,
@@ -85,7 +85,10 @@ game-side at init; bump on any struct change).
 - `VrSwing.cpp` — everything melee: swing tiers (blade-midpoint speed from runtime-filtered
   velocities + min hand speed floor), swept damage quads + strike quads, contact gathering
   (scene polys with back-face rejection & sticky ranking [collision-mesh mode only], dyna
-  probes, enemy AC capsules/spheres, AC_HARD), material impact SFX, knockback/press impulses
+  probes, AC_HARD; enemy BODY capsules/spheres are pushed in collision-mesh mode only —
+  visual-mesh mode leaves bodies solid via the harvested visible model, so pressing follows
+  what the player sees instead of the fat invisible AC cylinder; damage quads still hit the
+  real colliders), material impact SFX, knockback/press impulses
   (QUEUED at draw, applied in the player's update — displacement written at draw time is
   zeroed by the damage pass before consumption; vanilla `colChkInfo.mass` is IGNORED — it
   means "can't be walk-pushed", a Stalchild is MASS_HEAVY), **limb puppet system** (below),
@@ -123,7 +126,7 @@ lever (lifts all enemy/NPC limbs) proves the pipeline end-to-end in seconds.
 VR Settings → Physical Combat: speed tiers, blade collider (lengths per sword, width,
 thickness, roll −90° default, 3 shift sliders, tip taper), swing-through speed, cut
 resistance ×2, knockback, blade push, hit flinch amount, limb resistance, blade physics
-(snappiness ×2, contact reach, impact tolerance, bounce, friction), visual-mesh checkbox,
+(snappiness ×2, impact tolerance, friction), visual-mesh checkbox,
 diagnostics (debug overlay, physics log, pacifist mode, haptic tests, live readout).
 
 ## CVars quick reference (defaults)
@@ -133,8 +136,9 @@ Speeds: Arm 1.2 / Hit 2.2 / Heavy 4.0 / ReArm 0.8 / MinHand 0.6 (m/s)
 Blade: LenKokiri 30 / LenMaster 40 / LenBiggoron 55 / Width 4 / Thickness 0.4 / Roll −90 /
 ShiftFwd 0 / ShiftEdge 0 / ShiftFlat 0 / TipTaper 0.2
 Physics: Sword1HFreq 14 / SwordAngFreq 30 / MaxAccel 400 (**do not raise — jitter**) /
-MaxAngAccel 3000 / ContactReach 1.6 / TouchTolerance 0.3 / Bounce 0.25 / Friction 0.3 /
-PivotOnly 1
+MaxAngAccel 3000 / TouchTolerance 0.3 / Friction 0.3 / PivotOnly 1
+(ContactReach and Bounce were removed 2026-08: vestiges of the impulse solver, never read
+by the position-based sim.)
 Feel: PassthroughSpeed 2.2 / CutDragFlesh 0.55 / CutDragWorld 0.2 / KnockbackScale 1.0 /
 KnockbackCap 8.0 / PressPush 2.5 / FlinchAmount 18 / LimbResist 0.5 / LimbRadius 9 /
 LimbPushMax 22 / MeshRadius 150

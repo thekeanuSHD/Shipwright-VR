@@ -600,19 +600,6 @@ void SohMenu::AddMenuVRSettings() {
                      .Tooltip("How fast the blade's ANGLE follows your wrist. Raise this if the "
                               "sword lags behind during quick rotations; lower it for a heavier, "
                               "slower-turning weapon."));
-    AddWidget(physPath, "Contact Reach: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
-        .CVar("gVrPhysContactReach")
-        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
-        .Options(FloatSliderOptions()
-                     .Min(0.2f)
-                     .Max(6.0f)
-                     .DefaultValue(1.6f)
-                     .Step(0.1f)
-                     .Format("%.1f")
-                     .Tooltip("How far ahead (game units) surfaces start pushing back on the "
-                              "blade. This is what keeps contact stable instead of letting the "
-                              "blade sink in and snap out - too low brings back the shaking, too "
-                              "high makes the sword stop short of things."));
     AddWidget(physPath, "Blade Thickness: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysBladeThickness")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
@@ -653,7 +640,7 @@ void SohMenu::AddMenuVRSettings() {
                      .Min(-10.0f)
                      .Max(10.0f)
                      .DefaultValue(0.0f)
-                     .Step(0.25f)
+                     .Step(0.01f)
                      .Format("%.2f")
                      .Tooltip("Slides the physical blade rectangle lengthwise (game units). "
                               "Align the cyan debug outline with the visible steel."));
@@ -664,7 +651,7 @@ void SohMenu::AddMenuVRSettings() {
                      .Min(-10.0f)
                      .Max(10.0f)
                      .DefaultValue(0.0f)
-                     .Step(0.25f)
+                     .Step(0.01f)
                      .Format("%.2f")
                      .Tooltip("Slides the collider across the blade's width direction."));
     AddWidget(physPath, "Collider Shift Along Flat: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
@@ -674,7 +661,7 @@ void SohMenu::AddMenuVRSettings() {
                      .Min(-10.0f)
                      .Max(10.0f)
                      .DefaultValue(0.0f)
-                     .Step(0.25f)
+                     .Step(0.01f)
                      .Format("%.2f")
                      .Tooltip("Slides the collider perpendicular to the blade's flat plane."));
     AddWidget(physPath, "Limb Resistance: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
@@ -714,17 +701,6 @@ void SohMenu::AddMenuVRSettings() {
                               "sparks and rumble. Because the blade is stopped exactly AT "
                               "surfaces rather than inside them, a little tolerance is needed or "
                               "impacts rarely register. Raise if hits feel like they get missed."));
-    AddWidget(physPath, "Blade Bounce: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
-        .CVar("gVrPhysBounceRestitution")
-        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
-        .Options(FloatSliderOptions()
-                     .Min(0.0f)
-                     .Max(1.0f)
-                     .DefaultValue(0.25f)
-                     .Step(0.05f)
-                     .Format("%.2f")
-                     .Tooltip("How much the blade rebounds off surfaces it can't cut. 0 = dead "
-                              "stop and slide, 1 = full elastic bounce."));
     AddWidget(physPath, "Swing-Through Speed: %.1f m/s", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysPassthroughSpeed")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
@@ -758,8 +734,8 @@ void SohMenu::AddMenuVRSettings() {
                      .DefaultValue(1.0f)
                      .Step(0.1f)
                      .Format("%.1f")
-                     .Tooltip("How hard landed hits shove enemies, scaled by swing speed and "
-                              "enemy weight. Iron Knuckles and bosses never budge. 0 = off."));
+                     .Tooltip("How hard landed hits shove enemies, scaled by swing speed. "
+                              "Bosses and rooted enemies never budge. 0 = off."));
     AddWidget(physPath, "Blade Push Strength: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysPressPush")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
@@ -770,7 +746,8 @@ void SohMenu::AddMenuVRSettings() {
                      .Step(0.5f)
                      .Format("%.1f")
                      .Tooltip("Enemies get nudged away when you press the blade against them "
-                              "(no damage - just steel insisting). Mass-scaled. 0 = off."));
+                              "(no damage - just steel insisting). Bosses and rooted enemies "
+                              "stay put. 0 = off."));
     AddWidget(physPath, "Cut Resistance (Flesh): %.2f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysCutDragFlesh")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })

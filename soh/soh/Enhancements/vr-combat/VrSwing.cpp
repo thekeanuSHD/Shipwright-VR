@@ -262,6 +262,23 @@ void QueueImpulse(Actor* victim, float dx, float dz) {
     }
 }
 
+// A stored Actor* is only safe to dereference if it is still in the live actor lists — a victim
+// recorded by the collision pass can be freed before we read it back (a sword-struck switch or
+// BG actor that kills itself updates BEFORE the player does).
+bool ActorIsLive(PlayState* play, Actor* target) {
+    if (target == nullptr) {
+        return false;
+    }
+    for (size_t c = 0; c < ARRAY_COUNT(play->actorCtx.actorLists); c++) {
+        for (Actor* a = play->actorCtx.actorLists[c].head; a != NULL; a = a->next) {
+            if (a == target) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // The per-tick puppet solve: every recorded limb vs the blade segment. Called from FeedMelee
 // with the effective (sim) blade endpoints, world units.
 void PuppetSolve(const Vec3f& base, const Vec3f& tip) {
@@ -454,10 +471,14 @@ inline float SegTriDist2(const Vec3f& s0, const Vec3f& s1, const Vec3f& a, const
 }
 
 // Push this tick's contact primitives: what the virtual blade must NOT pass through — the blade
-// is always a solid object, at any speed. Level geometry (short line probes around the blade),
-// hard actor colliders (AC_HARD — armor, carapaces, enemy shields), and enemy bodies, all
-// treated identically. Breakables (pots, bushes) are deliberately NOT solid: the blade passes
-// through and the swept quads smash them.
+// is always a solid object, at any speed. Level geometry (short line probes around the blade)
+// and hard actor colliders (AC_HARD — armor, carapaces, enemy shields). Enemy BODIES are only
+// solid via what the player can SEE: in visual-mesh mode the rendered model is harvested and
+// the fat vanilla AC cylinder is NOT pushed (it reads as an invisible barrel the blade stops
+// on in mid-air); in collision-mesh mode the AC prims are all there is, so they stay. Damage
+// is unaffected either way — fast swings pass through and the swept quads hit the real
+// collider. Breakables (pots, bushes) are deliberately NOT solid: the blade passes through
+// and the swept quads smash them.
 void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const Vec3f& tip) {
     VrContactPrim prims[VR_PHYS_MAX_CONTACT_PRIMS];
     int n = 0;
@@ -679,6 +700,8 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
 
     // Actor colliders, from this tick's AC registrations (populated: enemies updated before draw).
     CollisionCheckContext* colChk = &play->colChkCtx;
+    Actor* pressedActors[8];
+    int pressedCount = 0;
     for (int i = 0; i < colChk->colACCount && n < VR_PHYS_MAX_CONTACT_PRIMS; i++) {
         Collider* col = colChk->colAC[i];
         if (col == NULL || col->actor == NULL || col->actor == &player->actor) {
@@ -699,12 +722,20 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
         // M3: enemies are PUSHED by the blade pressing on them (not just struck). When the
         // blade surface is within a couple of units of the enemy's collider surface, feed the
         // one-tick displacement channel — the same post-update positional impulse vanilla
-        // collision pushes use, so enemy AI and animations stay untouched. Mass-scaled,
-        // ground-plane only; heavies and immovables don't budge.
+        // collision pushes use, so enemy AI and animations stay untouched. Ground-plane only,
+        // ONCE per actor per tick (a JntSph body has many elements in reach at once); bosses
+        // and MASS_IMMOVABLE actors never budge. Vanilla mass is otherwise ignored — see the
+        // hit-feel note in Swing_OnPlayerUpdate.
         auto pressPush = [&](const Vec3f& surfCenter, float surfRadius) {
             // Enemies only: NPCs' limbs react but their bodies stay planted.
-            if (!enemyBody || hard || col->actor->category == ACTORCAT_BOSS) {
+            if (!enemyBody || hard || col->actor->category == ACTORCAT_BOSS ||
+                col->actor->colChkInfo.mass == MASS_IMMOVABLE) {
                 return;
+            }
+            for (int pi = 0; pi < pressedCount; pi++) {
+                if (pressedActors[pi] == col->actor) {
+                    return; // this actor already took its press this tick
+                }
             }
             const Vec3f bladeDir = vnorm(vsub(tip, base));
             const float bladeLen = vdist(base, tip);
@@ -724,6 +755,9 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
                 const float push = CVarGetFloat("gVrPhysPressPush", 2.5f);
                 // Queued: written here (draw time) it would be zeroed before consumption.
                 QueueImpulse(col->actor, (away.x / d) * push, (away.z / d) * push);
+                if (pressedCount < 8) {
+                    pressedActors[pressedCount++] = col->actor;
+                }
             }
 
             // Limb-level press deformation is handled by the puppet solve (PuppetSolve),
@@ -739,23 +773,33 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
             }
         }
 
+        // Bodies are solid via the RENDERED model in visual-mesh mode (harvested as FLESH) —
+        // only AC_HARD stays a prim there. Collision-mesh mode has no harvest, so body prims
+        // are all the blade can rest on and they stay. Press detection and puppet tracking
+        // above run off the AC colliders in both modes regardless.
+        const bool solidPrim = hard || !visualMesh;
         if (col->shape == COLSHAPE_CYLINDER) {
             ColliderCylinder* cyl = (ColliderCylinder*)col;
             if (cyl->dim.radius <= 0) {
                 continue;
             }
-            VrContactPrim& pr = prims[n++];
-            pr.type = VR_PHYS_PRIM_CAPSULE;
-            pr.a[0] = (float)cyl->dim.pos.x;
-            pr.a[1] = (float)(cyl->dim.pos.y + cyl->dim.yShift);
-            pr.a[2] = (float)cyl->dim.pos.z;
-            pr.b[0] = pr.a[0];
-            pr.b[1] = pr.a[1] + (float)cyl->dim.height;
-            pr.b[2] = pr.a[2];
-            pr.radius = (float)cyl->dim.radius;
-            pr.id = primId;
-            const Vec3f cylMid = { pr.a[0], pr.a[1] + (float)cyl->dim.height * 0.5f, pr.a[2] };
-            pressPush(cylMid, pr.radius);
+            const float baseX = (float)cyl->dim.pos.x;
+            const float baseY = (float)(cyl->dim.pos.y + cyl->dim.yShift);
+            const float baseZ = (float)cyl->dim.pos.z;
+            const Vec3f cylMid = { baseX, baseY + (float)cyl->dim.height * 0.5f, baseZ };
+            pressPush(cylMid, (float)cyl->dim.radius);
+            if (solidPrim) {
+                VrContactPrim& pr = prims[n++];
+                pr.type = VR_PHYS_PRIM_CAPSULE;
+                pr.a[0] = baseX;
+                pr.a[1] = baseY;
+                pr.a[2] = baseZ;
+                pr.b[0] = baseX;
+                pr.b[1] = baseY + (float)cyl->dim.height;
+                pr.b[2] = baseZ;
+                pr.radius = (float)cyl->dim.radius;
+                pr.id = primId;
+            }
         } else if (col->shape == COLSHAPE_JNTSPH) {
             ColliderJntSph* jntSph = (ColliderJntSph*)col;
             for (int e = 0; e < jntSph->count && n < VR_PHYS_MAX_CONTACT_PRIMS; e++) {
@@ -763,16 +807,20 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
                 if (el->dim.worldSphere.radius <= 0) {
                     continue;
                 }
-                VrContactPrim& pr = prims[n++];
-                pr.type = VR_PHYS_PRIM_SPHERE;
-                pr.a[0] = (float)el->dim.worldSphere.center.x;
-                pr.a[1] = (float)el->dim.worldSphere.center.y;
-                pr.a[2] = (float)el->dim.worldSphere.center.z;
-                pr.b[0] = pr.b[1] = pr.b[2] = 0.0f;
-                pr.radius = (float)el->dim.worldSphere.radius;
-                pr.id = primId;
-                const Vec3f sphC = { pr.a[0], pr.a[1], pr.a[2] };
-                pressPush(sphC, pr.radius);
+                const Vec3f sphC = { (float)el->dim.worldSphere.center.x,
+                                     (float)el->dim.worldSphere.center.y,
+                                     (float)el->dim.worldSphere.center.z };
+                pressPush(sphC, (float)el->dim.worldSphere.radius);
+                if (solidPrim) {
+                    VrContactPrim& pr = prims[n++];
+                    pr.type = VR_PHYS_PRIM_SPHERE;
+                    pr.a[0] = sphC.x;
+                    pr.a[1] = sphC.y;
+                    pr.a[2] = sphC.z;
+                    pr.b[0] = pr.b[1] = pr.b[2] = 0.0f;
+                    pr.radius = (float)el->dim.worldSphere.radius;
+                    pr.id = primId;
+                }
             }
         }
     }
@@ -834,6 +882,10 @@ void EnsureQuads(PlayState* play, Player* player) {
     sQuadsUsed = 0;
     sTier = TIER_IDLE;
     sHaveBladePrev = false;
+    // New scene: puppet/impulse Actor* keys from the previous scene must not survive to match
+    // recycled allocations in this one.
+    memset(sPuppets, 0, sizeof(sPuppets));
+    sImpulseCount = 0;
 }
 
 // Reconstruct a world-space blade point at an older grip sample: local = the point expressed in
@@ -1041,13 +1093,17 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
             // physical rectangle along the blade / across the edge / through the flat until
             // it sits exactly on the visible steel. Applies to the collider and the debug
             // outline (which is the alignment tool), never to the damage quads.
+            // NO x100 here: tipLocal0/baseLocal0 came OUT of the hand matrix, so this frame
+            // is already world units — the model-space x100 convention only applies to values
+            // fed INTO the matrix (blade length). Scaling the sliders by 100 made one 0.25
+            // step throw the collider a couple of feet.
             const Vec3f fwdDir = vnorm(vsub(tipLocal0, baseLocal0));
             const Vec3f widthDir = vnorm(widthLocal0);
             const Vec3f flatDir = vnorm(vcross(fwdDir, widthDir));
             const Vec3f colShift =
-                vadd(vadd(vscale(fwdDir, CVarGetFloat("gVrPhysBladeShiftFwd", 0.0f) * 100.0f),
-                          vscale(widthDir, CVarGetFloat("gVrPhysBladeShiftEdge", 0.0f) * 100.0f)),
-                     vscale(flatDir, CVarGetFloat("gVrPhysBladeShiftFlat", 0.0f) * 100.0f));
+                vadd(vadd(vscale(fwdDir, CVarGetFloat("gVrPhysBladeShiftFwd", 0.0f)),
+                          vscale(widthDir, CVarGetFloat("gVrPhysBladeShiftEdge", 0.0f))),
+                     vscale(flatDir, CVarGetFloat("gVrPhysBladeShiftFlat", 0.0f)));
             const Vec3f baseAdj = vadd(baseLocal0, colShift);
             const Vec3f tipAdj = vadd(tipLocal0, colShift);
             desc.gripLocalRootM[0] = baseAdj.x / worldScale;
@@ -1072,13 +1128,11 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
             sDebugBladeValid = true;
         }
         desc.contactEnabled = 1;
-        desc.restitution = CVarGetFloat("gVrPhysBounceRestitution", 0.25f);
         // Low default friction: steel skates along stone/flesh instead of planting.
         desc.friction = CVarGetFloat("gVrPhysBladeFriction", 0.3f);
         // Contact distances are authored in GAME UNITS (what the blade-length sliders use) and
         // converted to meters here, so they mean the same thing at any world scale.
         desc.bladeRadiusM = CVarGetFloat("gVrPhysBladeThickness", 0.4f) / worldScale;
-        desc.speculativeM = CVarGetFloat("gVrPhysContactReach", 1.6f) / worldScale;
         desc.touchToleranceM = CVarGetFloat("gVrPhysTouchTolerance", 0.3f) / worldScale;
         desc.maxAngAccel = CVarGetFloat("gVrPhysMaxAngAccel", 3000.0f);
         desc.pivotOnly = CVarGetInteger("gVrPhysPivotOnly", 1);
@@ -1246,26 +1300,14 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
     // displacement) already ran this tick, and enemies update after the player — so writes
     // here land this very tick. Victims are validated against the live actor lists first; a
     // pointer that isn't there anymore (died from the hit that queued this) is dropped.
-    if (sImpulseCount > 0) {
-        static const u8 kCats[] = { ACTORCAT_ENEMY, ACTORCAT_BOSS, ACTORCAT_NPC, ACTORCAT_PROP };
-        for (int i = 0; i < sImpulseCount; i++) {
-            Actor* target = sImpulses[i].actor;
-            bool alive = false;
-            for (size_t c = 0; c < ARRAY_COUNT(kCats) && !alive; c++) {
-                for (Actor* a = play->actorCtx.actorLists[kCats[c]].head; a != NULL; a = a->next) {
-                    if (a == target) {
-                        alive = true;
-                        break;
-                    }
-                }
-            }
-            if (alive) {
-                target->colChkInfo.displacement.x += sImpulses[i].d.x;
-                target->colChkInfo.displacement.z += sImpulses[i].d.z;
-            }
+    for (int i = 0; i < sImpulseCount; i++) {
+        Actor* target = sImpulses[i].actor;
+        if (ActorIsLive(play, target)) {
+            target->colChkInfo.displacement.x += sImpulses[i].d.x;
+            target->colChkInfo.displacement.z += sImpulses[i].d.z;
         }
-        sImpulseCount = 0;
     }
+    sImpulseCount = 0;
 
     // Weapon switched to something physical combat doesn't cover: release the sim slot so the
     // hand pose reverts to the raw controller (the draw-time feed only runs for covered weapons).
@@ -1333,11 +1375,12 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
             continue;
         }
         hit = true;
-        // M3 hit feel. Vanilla colChkInfo.mass is IGNORED here: it encodes "Link can't shove
-        // me by walking into me" (a tiny Stalchild carries MASS_HEAVY), not weight. Sword
+        // M3 hit feel. Vanilla colChkInfo.mass MOSTLY doesn't mean weight: it encodes "Link
+        // can't shove me by walking into me" (a tiny Stalchild carries MASS_HEAVY), so sword
         // impacts scale by category instead — full effect on enemies/NPCs, none on bosses.
+        // The one honored value is MASS_IMMOVABLE, which genuinely means "never displaced".
         Actor* victim = sQuads[i].base.at;
-        if (victim != NULL && victim->category != ACTORCAT_BOSS) {
+        if (ActorIsLive(play, victim) && victim->category != ACTORCAT_BOSS) {
             Vec3f dir = vsub(victim->world.pos, player->actor.world.pos);
             dir.y = 0.0f;
             const float dl = sqrtf(dir.x * dir.x + dir.z * dir.z);
@@ -1347,7 +1390,7 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
                 // Micro-push, queued: displacement written now would be zeroed by the damage
                 // pass before the victim consumes it — it lands from the player UPDATE instead.
                 // NPCs are exempt: their limbs react but they stay planted.
-                if (victim->category != ACTORCAT_NPC) {
+                if (victim->category != ACTORCAT_NPC && victim->colChkInfo.mass != MASS_IMMOVABLE) {
                     float mag = sTickTipSpeed * CVarGetFloat("gVrPhysKnockbackScale", 1.0f) * 1.5f;
                     const float cap = CVarGetFloat("gVrPhysKnockbackCap", 8.0f);
                     if (mag > cap) {
@@ -1454,6 +1497,11 @@ void Swing_Deactivate(PlayState* play, Player* player) {
     sHaveBladePrev = false;
     sPendingStrikeCount = 0;
     sDebugBladeValid = false;
+    // Drop the puppets: the skelanime warp hooks keep running while combat is off and match
+    // by actor pointer, so a limb displaced at the moment of deactivation would otherwise
+    // stay warped forever (nothing solves or decays the offsets anymore).
+    memset(sPuppets, 0, sizeof(sPuppets));
+    sImpulseCount = 0;
     player->meleeWeaponState = 0;
     player->meleeWeaponInfo[0].active = 0;
     player->meleeWeaponInfo[1].active = 0;

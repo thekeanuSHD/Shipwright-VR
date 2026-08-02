@@ -75,7 +75,6 @@ static Result RunCase(float hz, int mode, bool handNoise, float angFreq = 30.0f,
     desc.ang_zeta = 1.0f;
     desc.max_accel_mps2 = maxAccel;
     desc.blade_radius_m = 0.4f / kScale;
-    desc.speculative_m = 1.6f / kScale;
     desc.touch_tolerance_m = 0.3f / kScale;
     desc.max_ang_accel = maxAngAccel;
     desc.pivot_only = true; // mirrors the game default (gVrPhysPivotOnly 1)
@@ -93,7 +92,6 @@ static Result RunCase(float hz, int mode, bool handNoise, float angFreq = 30.0f,
         desc.grip_local_tip_m[2] = 0.8f;
     }
     desc.contact_enabled = true;
-    desc.restitution = 0.25f;
     desc.friction = friction;
     vrphys_set_object(VRPHYS_SLOT_WEAPON, &desc);
 
@@ -309,6 +307,155 @@ static Result RunCase(float hz, int mode, bool handNoise, float angFreq = 30.0f,
     return r;
 }
 
+// --------------------------------------------------------------------------
+// Visual-mesh harvest scenarios: the selection layer (which tris reach the solver) has its own
+// failure modes independent of the solver — ranking against a mis-transformed blade after snap
+// turns, and stereo eye-duplicates crowding unique geometry out of the selection slots.
+// --------------------------------------------------------------------------
+
+static void FeedMeshTri(float ax, float ay, float az, float bx, float by, float bz, float cx,
+                        float cy, float cz) {
+    const float a[3] = { ax, ay, az }, b[3] = { bx, by, bz }, c[3] = { cx, cy, cz };
+    vrphys_mesh_consider_tri(a, b, c);
+}
+
+static VrPhysObjectDesc MeshCaseDesc() {
+    VrPhysObjectDesc desc{};
+    desc.primary_hand = 1;
+    desc.secondary_hand = -1;
+    desc.lin_freq_hz = 14.0f;
+    desc.lin_zeta = 1.0f;
+    desc.ang_freq_hz = 30.0f;
+    desc.ang_zeta = 1.0f;
+    desc.max_accel_mps2 = 400.0f;
+    desc.max_ang_accel = 3000.0f;
+    desc.blade_radius_m = 0.4f / kScale;
+    desc.touch_tolerance_m = 0.3f / kScale;
+    desc.pivot_only = true;
+    desc.grip_local_tip_m[0] = 1.13f;
+    desc.grip_local_edge_m[2] = 2.0f / kScale;
+    desc.tip_taper_frac = 0.2f;
+    desc.contact_enabled = true;
+    desc.friction = 0.15f;
+    return desc;
+}
+
+// A 90-degree accumulated snap turn with a 2 m pivot offset (a few snap turns' worth): tri
+// selection must rank against the blade's TRUE world position. 48 small decoy tris tile the
+// exact spot where a rotate-before-offset transform bug places the blade (displaced by
+// scale*(R*off - off) = (-70, 0, -70), ~99 units); 16 real wall tris sit where the blade
+// actually is. If ranking uses the phantom segment, the decoys win every selection slot from
+// the first step (the wall never even earns sticky preference), the real wall never reaches
+// the solver, and driving the blade through it records zero contacts.
+static int RunMeshTurnCase() {
+    vrphys_reset();
+    const float s45 = sinf(3.14159265f / 4.0f);
+    const float turn[4] = { 0.0f, s45, 0.0f, s45 }; // +90 deg yaw: R*(x,y,z) = (z, y, -x)
+    const float turnOff[3] = { 2.0f, 0.0f, 0.0f };  // meters, world-space, applied AFTER R
+    const float anchor[3] = { 0.0f, 0.0f, 0.0f };
+    vrphys_set_contact_prims(nullptr, 0); // mesh-only case
+
+    VrPhysObjectDesc desc = MeshCaseDesc();
+    vrphys_set_object(VRPHYS_SLOT_WEAPON, &desc);
+
+    const float dt = 1.0f / 90.0f;
+    uint64_t t = 0;
+    float hx = -0.60f;
+    int zeroContactPressSteps = 0;
+
+    for (int step = 0; step < 120; step++) {
+        if (step > 0 && step < 90) {
+            hx += 0.010f; // drive the blade (world -Z at x=17.5) through the wall plane
+        }
+        const float pos[3] = { hx, 0.0f, 0.0f };
+        const float quat[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        const float lin[3] = { (step > 0 && step < 90) ? 0.010f / dt : 0.0f, 0.0f, 0.0f };
+        const float ang[3] = { 0.0f, 0.0f, 0.0f };
+        t += (uint64_t)(dt * 1e9f);
+        vrphys_push_hand_sample(1, pos, quat, lin, ang, true, t);
+
+        // The game feeds region + tris in true world units: world = (R*raw + off) * scale.
+        // True blade line: x = 70, running toward -Z. Phantom (buggy) line: x = 0, 70 deeper.
+        const float midRawX = hx + 1.13f * 0.5f;
+        const float midW[3] = { 2.0f * kScale, 0.0f, -midRawX * kScale };
+        vrphys_mesh_set_region(midW, 150.0f, true);
+        // Real wall: 4-unit tiles at z = -35 around the blade line (x = 70), facing +Z.
+        for (int gx = 0; gx < 2; gx++) {
+            for (int gy = -2; gy < 2; gy++) {
+                const float x0 = 66.0f + gx * 4.0f;
+                const float y0 = gy * 4.0f;
+                FeedMeshTri(x0, y0, -35, x0 + 4, y0, -35, x0, y0 + 4, -35);
+                FeedMeshTri(x0 + 4, y0, -35, x0 + 4, y0 + 4, -35, x0, y0 + 4, -35);
+            }
+        }
+        // Decoys: tiles on z = -90 within ~10 units of x=0/y=0 — sitting on the phantom
+        // segment (which sweeps z -88..-120 there), ranking ~70 units better than every real
+        // tile against it, yet 70 units from the true blade so they never contact under
+        // correct selection.
+        for (int gx = -3; gx < 3; gx++) {
+            for (int gy = -3; gy < 3; gy++) {
+                const float cx = gx * 4.0f + 2.0f;
+                const float cy = gy * 4.0f + 2.0f;
+                if (cx * cx + cy * cy > 10.5f * 10.5f) {
+                    continue;
+                }
+                const float x0 = cx - 2.0f, y0 = cy - 2.0f, z = -90.0f;
+                FeedMeshTri(x0, y0, z, x0 + 4, y0, z, x0, y0 + 4, z);
+                FeedMeshTri(x0 + 4, y0, z, x0 + 4, y0 + 4, z, x0, y0 + 4, z);
+            }
+        }
+        vrphys_step(dt, turn, turnOff, anchor, kScale, true);
+
+        float cp[12], cn[12];
+        const int nc = vrphys_get_object_contacts(VRPHYS_SLOT_WEAPON, cp, cn, 4);
+        if (step >= 60 && step < 90 && nc == 0) {
+            zeroContactPressSteps++; // blade is through the wall plane here: must be touching
+        }
+    }
+    return zeroContactPressSteps;
+}
+
+// Stereo harvest: both eyes feed identical world-space tris, so every tri arrives twice.
+// 24 unique floor tris fed twice must ALL reach the solver — if eye-duplicates burn
+// selection slots, only ~16 unique survive.
+static int RunMeshStereoCase() {
+    vrphys_reset();
+    const float turn[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const float turnOff[3] = { 0.0f, 0.0f, 0.0f };
+    const float anchor[3] = { 0.0f, 0.0f, 0.0f };
+    vrphys_set_contact_prims(nullptr, 0);
+
+    VrPhysObjectDesc desc = MeshCaseDesc();
+    vrphys_set_object(VRPHYS_SLOT_WEAPON, &desc);
+
+    const float dt = 1.0f / 90.0f;
+    uint64_t t = 0;
+    for (int step = 0; step < 5; step++) {
+        const float pos[3] = { 0.0f, 0.0f, 0.0f };
+        const float quat[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        const float lin[3] = { 0.0f, 0.0f, 0.0f };
+        const float ang[3] = { 0.0f, 0.0f, 0.0f };
+        t += (uint64_t)(dt * 1e9f);
+        vrphys_push_hand_sample(1, pos, quat, lin, ang, true, t);
+
+        const float midW[3] = { 0.565f * kScale, 0.0f, 0.0f }; // blade mid, world units
+        vrphys_mesh_set_region(midW, 150.0f, true);
+        for (int eye = 0; eye < 2; eye++) { // both eyes harvest the same 24 tris
+            for (int gx = 0; gx < 6; gx++) {
+                for (int gz = -1; gz < 1; gz++) {
+                    const float x0 = gx * 4.0f;
+                    const float z0 = gz * 4.0f;
+                    FeedMeshTri(x0, -2, z0, x0, -2, z0 + 4, x0 + 4, -2, z0);
+                    FeedMeshTri(x0, -2, z0 + 4, x0 + 4, -2, z0 + 4, x0 + 4, -2, z0);
+                }
+            }
+        }
+        vrphys_step(dt, turn, turnOff, anchor, kScale, true);
+    }
+    float tribuf[32 * 9];
+    return vrphys_mesh_get_debug_tris(tribuf, 32); // unique tris that reached the solver
+}
+
 int main() {
     struct Case {
         const char* name;
@@ -360,6 +507,13 @@ int main() {
         printf("%-32s | HF %7.3f mm | grip dev %5.2f mm | contacts %d-%d | zero-contact %d\n",
                c.name, r.heldJitterMm, r.gripDevMm, r.minContacts, r.maxContacts, r.zeroContactSteps);
     }
+
+    printf("\n=== VISUAL-MESH selection (turned-context ranking + stereo duplicate slots) ===\n");
+    const int turnZero = RunMeshTurnCase();
+    printf("  snap-turned tri ranking      | zero-contact press steps %d (expect 0)\n", turnZero);
+    const int stereoUniq = RunMeshStereoCase();
+    printf("  stereo duplicate harvest     | unique tris reaching solver %d/24 (expect 24)\n",
+           stereoUniq);
 
     printf("\n=== FRICTION A/B (tip pressed on flat wall, hand drags sideways at 0.36 m/s) ===\n");
     const float frics[] = { 0.0f, 0.15f, 0.3f, 0.6f, 0.9f };
