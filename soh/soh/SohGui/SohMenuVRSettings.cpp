@@ -640,12 +640,55 @@ void SohMenu::AddMenuVRSettings() {
         .Options(FloatSliderOptions()
                      .Min(-180.0f)
                      .Max(180.0f)
-                     .DefaultValue(0.0f)
+                     .DefaultValue(-90.0f)
                      .Step(5.0f)
                      .Format("%.0f")
                      .Tooltip("Rotates the flat blade collider about the blade axis. Turn on the "
                               "debug overlay and adjust until the cyan rectangle lies in the "
                               "same plane as the visible blade."));
+    AddWidget(physPath, "Collider Shift Along Blade: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeShiftFwd")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(-10.0f)
+                     .Max(10.0f)
+                     .DefaultValue(0.0f)
+                     .Step(0.25f)
+                     .Format("%.2f")
+                     .Tooltip("Slides the physical blade rectangle lengthwise (game units). "
+                              "Align the cyan debug outline with the visible steel."));
+    AddWidget(physPath, "Collider Shift Along Edge: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeShiftEdge")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(-10.0f)
+                     .Max(10.0f)
+                     .DefaultValue(0.0f)
+                     .Step(0.25f)
+                     .Format("%.2f")
+                     .Tooltip("Slides the collider across the blade's width direction."));
+    AddWidget(physPath, "Collider Shift Along Flat: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBladeShiftFlat")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(-10.0f)
+                     .Max(10.0f)
+                     .DefaultValue(0.0f)
+                     .Step(0.25f)
+                     .Format("%.2f")
+                     .Tooltip("Slides the collider perpendicular to the blade's flat plane."));
+    AddWidget(physPath, "Limb Resistance: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysLimbResist")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(1.0f)
+                     .DefaultValue(0.5f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("How much limbs fight back against the blade: 0 = ragdoll-loose, "
+                              "1 = they barely budge. Limbs lag behind your push and spring "
+                              "back firmly."));
     AddWidget(physPath, "Blade Tip Taper: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysBladeTipTaper")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
@@ -694,6 +737,40 @@ void SohMenu::AddMenuVRSettings() {
                      .Tooltip("Swings faster than this cut THROUGH surfaces instead of stopping "
                               "on them; gentle contact still rests on the surface. 0 = the "
                               "blade never passes through anything."));
+    AddWidget(physPath, "Hit Flinch Amount: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysFlinchAmount")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(60.0f)
+                     .DefaultValue(18.0f)
+                     .Step(1.0f)
+                     .Format("%.0f")
+                     .Tooltip("Punching-bag hit reaction: how far a struck body caves toward "
+                              "the swing around the impact point before springing back. Purely "
+                              "visual - hitboxes and enemy AI never move. 0 = off."));
+    AddWidget(physPath, "Knockback Strength: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysKnockbackScale")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(3.0f)
+                     .DefaultValue(1.0f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("How hard landed hits shove enemies, scaled by swing speed and "
+                              "enemy weight. Iron Knuckles and bosses never budge. 0 = off."));
+    AddWidget(physPath, "Blade Push Strength: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysPressPush")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(6.0f)
+                     .DefaultValue(2.5f)
+                     .Step(0.5f)
+                     .Format("%.1f")
+                     .Tooltip("Enemies get nudged away when you press the blade against them "
+                              "(no damage - just steel insisting). Mass-scaled. 0 = off."));
     AddWidget(physPath, "Cut Resistance (Flesh): %.2f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysCutDragFlesh")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
@@ -731,6 +808,12 @@ void SohMenu::AddMenuVRSettings() {
                               "as you drag it across walls and floors."));
 
     AddWidget(physPath, "Diagnostics", WIDGET_SEPARATOR_TEXT);
+    AddWidget(physPath, "Pacify Enemies (Testing)", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVrPhysPacifist")
+        .Options(CheckboxOptions().Tooltip(
+            "Freezes all enemies solid: no AI, no detection, no attacks, animation paused - "
+            "living statues for testing blade physics and limb manipulation. Damage still "
+            "lands. Uncheck to thaw."));
     AddWidget(physPath, "Record Physics Log", WIDGET_CVAR_CHECKBOX)
         .CVar("gVrPhysLog")
         .Options(CheckboxOptions().Tooltip(

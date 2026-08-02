@@ -1,5 +1,6 @@
 #include "global.h"
 #include "vt.h"
+#include "soh/Enhancements/vr-combat/VrCombat.h"
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
@@ -46,7 +47,10 @@ void SkelAnime_DrawLimbLod(PlayState* play, s32 limbIndex, void** skeleton, Vec3
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, limbIndex, &dList, &pos, &rot, arg)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (dList != NULL) {
+            // SOH [VR] hit-flinch limb warp (no-op unless this actor was just struck)
+            VrCombat_FlinchWarpBegin(play, arg, limbIndex);
             gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_LOAD);
+            VrCombat_FlinchWarpEnd();
             gSPDisplayList(POLY_OPA_DISP++, dList);
         }
     }
@@ -106,7 +110,10 @@ void SkelAnime_DrawLod(PlayState* play, void** skeleton, Vec3s* jointTable, Over
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, 1, &dList, &pos, &rot, arg)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (dList != NULL) {
+            // SOH [VR] hit-flinch limb warp (no-op unless this actor was just struck)
+            VrCombat_FlinchWarpBegin(play, arg, 1);
             gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_LOAD);
+            VrCombat_FlinchWarpEnd();
             gSPDisplayList(POLY_OPA_DISP++, dList);
         }
     }
@@ -276,7 +283,10 @@ void SkelAnime_DrawLimbOpa(PlayState* play, s32 limbIndex, void** skeleton, Vec3
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, limbIndex, &dList, &pos, &rot, arg)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (dList != NULL) {
+            // SOH [VR] hit-flinch limb warp (no-op unless this actor was just struck)
+            VrCombat_FlinchWarpBegin(play, arg, limbIndex);
             gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_LOAD);
+            VrCombat_FlinchWarpEnd();
             gSPDisplayList(POLY_OPA_DISP++, dList);
         }
     }
@@ -357,7 +367,10 @@ void SkelAnime_DrawOpa(PlayState* play, void** skeleton, Vec3s* jointTable, Over
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, 1, &dList, &pos, &rot, arg)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (dList != NULL) {
+            // SOH [VR] hit-flinch limb warp (no-op unless this actor was just struck)
+            VrCombat_FlinchWarpBegin(play, arg, 1);
             gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_LOAD);
+            VrCombat_FlinchWarpEnd();
             gSPDisplayList(POLY_OPA_DISP++, dList);
         }
     }
@@ -406,12 +419,17 @@ void SkelAnime_DrawFlexLimbOpa(PlayState* play, s32 limbIndex, void** skeleton, 
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, limbIndex, &newDList, &pos, &rot, arg)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (newDList != NULL) {
+            // SOH [VR] hit-flinch limb warp (offset applies to the skinned mesh too)
+            VrCombat_FlinchWarpBegin(play, arg, limbIndex);
             MATRIX_TOMTX(*limbMatricies);
+            VrCombat_FlinchWarpEnd();
             gSPMatrix(POLY_OPA_DISP++, *limbMatricies, G_MTX_LOAD);
             gSPDisplayList(POLY_OPA_DISP++, newDList);
             (*limbMatricies)++;
         } else if (limbDList != NULL) {
+            VrCombat_FlinchWarpBegin(play, arg, limbIndex);
             MATRIX_TOMTX(*limbMatricies);
+            VrCombat_FlinchWarpEnd();
             (*limbMatricies)++;
         }
     }
@@ -475,12 +493,17 @@ void SkelAnime_DrawFlexOpa(PlayState* play, void** skeleton, Vec3s* jointTable, 
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, 1, &newDList, &pos, &rot, arg)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (newDList != NULL) {
+            // SOH [VR] hit-flinch limb warp
+            VrCombat_FlinchWarpBegin(play, arg, 1);
             MATRIX_TOMTX(mtx);
+            VrCombat_FlinchWarpEnd();
             gSPMatrix(POLY_OPA_DISP++, mtx, G_MTX_LOAD);
             gSPDisplayList(POLY_OPA_DISP++, newDList);
             mtx++;
         } else if (limbDList != NULL) {
+            VrCombat_FlinchWarpBegin(play, arg, 1);
             MATRIX_TOMTX(mtx);
+            VrCombat_FlinchWarpEnd();
             mtx++;
         }
     }
@@ -675,12 +698,17 @@ Gfx* SkelAnime_DrawFlexLimb(PlayState* play, s32 limbIndex, void** skeleton, Vec
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, limbIndex, &newDList, &pos, &rot, arg, &gfx)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (newDList != NULL) {
+            // SOH [VR] limb puppet warp
+            VrCombat_FlinchWarpBegin(play, arg, limbIndex);
             MATRIX_TOMTX(*mtx);
+            VrCombat_FlinchWarpEnd();
             gSPMatrix(gfx++, *mtx, G_MTX_LOAD);
             gSPDisplayList(gfx++, newDList);
             (*mtx)++;
         } else if (limbDList != NULL) {
+            VrCombat_FlinchWarpBegin(play, arg, limbIndex);
             MATRIX_TOMTX(*mtx);
+            VrCombat_FlinchWarpEnd();
             (*mtx)++;
         }
     }
@@ -740,12 +768,17 @@ Gfx* SkelAnime_DrawFlex(PlayState* play, void** skeleton, Vec3s* jointTable, s32
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, 1, &newDList, &pos, &rot, arg, &gfx)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
         if (newDList != NULL) {
+            // SOH [VR] limb puppet warp
+            VrCombat_FlinchWarpBegin(play, arg, 1);
             MATRIX_TOMTX(mtx);
+            VrCombat_FlinchWarpEnd();
             gSPMatrix(gfx++, mtx, G_MTX_LOAD);
             gSPDisplayList(gfx++, newDList);
             mtx++;
         } else if (limbDList != NULL) {
+            VrCombat_FlinchWarpBegin(play, arg, 1);
             MATRIX_TOMTX(mtx);
+            VrCombat_FlinchWarpEnd();
             mtx++;
         }
     }

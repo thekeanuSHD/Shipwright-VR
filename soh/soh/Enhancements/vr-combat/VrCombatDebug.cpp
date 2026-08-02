@@ -233,6 +233,24 @@ extern "C" void VrCombat_DrawDebugOverlay(void) {
         }
     }
 
+    // Puppet-tracked limbs: white dots = limbs the blade can manipulate; a dot turns red and
+    // grows while its limb is being displaced. If an actor shows no dots, it isn't tracked.
+    {
+        float limbPos[64 * 3];
+        float limbOff[64];
+        const int limbCount = VrCombat::Swing_GetDebugPuppetLimbs(limbPos, limbOff, 64);
+        for (int i = 0; i < limbCount; i++) {
+            const bool active = limbOff[i] > 0.5f;
+            if (active) {
+                sDl.push_back(gsDPSetPrimColor(0, 0, 255, 70, 70, 255));
+            } else {
+                sDl.push_back(gsDPSetPrimColor(0, 0, 235, 235, 235, 255));
+            }
+            PushMarker({ limbPos[i * 3], limbPos[i * 3 + 1], limbPos[i * 3 + 2] }, camEye,
+                       active ? 1.6f : 0.8f);
+        }
+    }
+
     // The physical blade rectangle (cyan outline): the exact collider the solver sweeps.
     float bladePts[5 * 3];
     if (VrCombat::Swing_GetDebugBladeOutline(bladePts) == 5) {

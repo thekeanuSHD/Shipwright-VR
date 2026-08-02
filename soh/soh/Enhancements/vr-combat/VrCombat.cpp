@@ -108,6 +108,22 @@ extern "C" void VrCombat_MeshMaskPop(GraphicsContext* gfxCtx) {
     gSPVrPhysMask(gfxCtx->polyXlu.p++, 0);
 }
 
+extern "C" void VrCombat_MeshFleshPush(GraphicsContext* gfxCtx) {
+    if (!VrCombat_Active() || !CVarGetInteger("gVrPhysVisualMesh", 1)) {
+        return;
+    }
+    gSPVrPhysMask(gfxCtx->polyOpa.p++, 2);
+    gSPVrPhysMask(gfxCtx->polyXlu.p++, 2);
+}
+
+extern "C" void VrCombat_MeshFleshPop(GraphicsContext* gfxCtx) {
+    if (!VrCombat_Active() || !CVarGetInteger("gVrPhysVisualMesh", 1)) {
+        return;
+    }
+    gSPVrPhysMask(gfxCtx->polyOpa.p++, 3);
+    gSPVrPhysMask(gfxCtx->polyXlu.p++, 3);
+}
+
 namespace VrCombat {
 
 const TickPath& GetTickPath(int hand) {

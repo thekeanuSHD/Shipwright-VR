@@ -50,6 +50,21 @@ void VrCombat_SetMeleeWeaponState(struct Player* player, int32_t newState);
 // commands into the OPA and XLU buckets. No-ops while physical combat is inactive.
 void VrCombat_MeshMaskPush(struct GraphicsContext* gfxCtx);
 void VrCombat_MeshMaskPop(struct GraphicsContext* gfxCtx);
+// Marks a display-list section as FLESH for the visual-mesh harvest (enemy/NPC bodies):
+// contacts stay silent (no stone clank/sparks) and read as bodies to the impact pipeline.
+void VrCombat_MeshFleshPush(struct GraphicsContext* gfxCtx);
+void VrCombat_MeshFleshPop(struct GraphicsContext* gfxCtx);
+
+// Limb puppetry: the blade manipulates individual limbs of nearby NPC/enemy skeletons —
+// rest the blade under an arm and the arm rides it; push a head and it tilts away; hits kick
+// the limbs near the impact. The Warp pair brackets each limb's matrix conversion in
+// z_skelanime.c: Begin records this limb's world position for the contact solve (the clean
+// animated pose) and then offsets the matrix translation by the limb's current puppet offset;
+// End restores it so child limbs compute cleanly. Purely visual: animation, hitboxes and AI
+// never see the offsets. `actorArg` is compared before any dereference against actors the
+// contact gather validated this tick.
+void VrCombat_FlinchWarpBegin(struct PlayState* play, void* actorArg, int32_t limbIndex);
+void VrCombat_FlinchWarpEnd(void);
 
 #ifdef __cplusplus
 }
@@ -89,6 +104,9 @@ int Swing_GetDebugQuads(float* outVerts12PerQuad, int maxQuads);
 // Physical blade rectangle outline (5 world-unit points: rootA, cornerA, tip, cornerB, rootB);
 // returns 0 when the sim blade is inactive.
 int Swing_GetDebugBladeOutline(float* outPts5x3);
+// Puppet-tracked limbs (world positions + current offset magnitude per limb). Overlay proof
+// of which bodies the blade can manipulate.
+int Swing_GetDebugPuppetLimbs(float* outPos3PerLimb, float* outOffsetMag, int maxLimbs);
 
 } // namespace VrCombat
 #endif

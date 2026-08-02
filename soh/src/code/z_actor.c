@@ -10,6 +10,7 @@
 #include "soh/ObjectExtension/ObjectExtension.h"
 #include "soh/ObjectExtension/ActorListIndex.h"
 #include "soh/frame_interpolation.h"
+#include "soh/Enhancements/vr-combat/VrCombat.h"
 #include "soh/Enhancements/cosmetics/cosmeticsTypes.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
@@ -445,6 +446,11 @@ void Attention_Draw(TargetContext* targetCtx, PlayState* play) {
 
     OPEN_DISPS(play->state.gfxCtx);
 
+    // SOH [VR] The in-world lock-on reticle/arrow are world geometry billboarded around the
+    // TARGET — without this mask they harvest as an invisible spinning collider wrapping
+    // every targetable NPC/enemy the player looks at.
+    VrCombat_MeshMaskPush(play->state.gfxCtx);
+
     if (targetCtx->unk_48 != 0) {
         TargetContextEntry* entry;
         Player* player;
@@ -599,6 +605,9 @@ void Attention_Draw(TargetContext* targetCtx, PlayState* play) {
         gSPDisplayList(POLY_XLU_DISP++, gZTargetArrowDL);
         FrameInterpolation_RecordCloseChild();
     }
+
+    // SOH [VR]
+    VrCombat_MeshMaskPop(play->state.gfxCtx);
 
     CLOSE_DISPS(play->state.gfxCtx);
 }
@@ -2841,7 +2850,27 @@ void Actor_Draw(PlayState* play, Actor* actor) {
         }
     }
 
-    actor->draw(actor, play);
+    // SOH [VR] Companion/effect-class actors (Navi, environmental sparkles, item pickups) are
+    // not physical for the blade: exclude their draws from the visual-mesh harvest. Living
+    // bodies (enemies, NPCs) harvest as FLESH so blade contact is silent instead of sparking
+    // like stone.
+    {
+        s32 vrMeshMasked =
+            (actor->category == ACTORCAT_ITEMACTION) || (actor->category == ACTORCAT_MISC);
+        s32 vrMeshFlesh = (actor->category == ACTORCAT_ENEMY) || (actor->category == ACTORCAT_BOSS) ||
+                          (actor->category == ACTORCAT_NPC);
+        if (vrMeshMasked) {
+            VrCombat_MeshMaskPush(play->state.gfxCtx);
+        } else if (vrMeshFlesh) {
+            VrCombat_MeshFleshPush(play->state.gfxCtx);
+        }
+        actor->draw(actor, play);
+        if (vrMeshMasked) {
+            VrCombat_MeshMaskPop(play->state.gfxCtx);
+        } else if (vrMeshFlesh) {
+            VrCombat_MeshFleshPop(play->state.gfxCtx);
+        }
+    }
 
     if (actor->colorFilterTimer != 0) {
         if (actor->colorFilterParams & 0x2000) {

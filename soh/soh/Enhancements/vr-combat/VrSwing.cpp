@@ -4,6 +4,7 @@ extern "C" {
 #include "functions.h"
 #include "sfx.h"
 extern PlayState* gPlayState;
+MtxF* Matrix_GetCurrent(void);
 }
 
 #include "VrCombat.h"
@@ -153,6 +154,192 @@ inline int PrimDetail(int id) {
 VrContactPrim sDebugPrims[VR_PHYS_MAX_CONTACT_PRIMS];
 int sDebugPrimCount = 0;
 
+// ---- M3 limb puppetry ----
+// Each tracked NPC/enemy is a "puppet": its limb world positions are recorded during draw
+// (the clean animated pose), and every tick each limb is solved against the blade as a small
+// sphere. A limb the blade intrudes on is offset outward exactly as far as the intrusion, so
+// it RESTS on the blade and follows it while touching (blade under an arm, moving up = the
+// arm rides the blade). Released limbs spring back to the animation; hits kick the offsets.
+// The offsets exist only at draw time — animation, hitboxes and AI never see them.
+constexpr int kPuppetLimbs = 26;
+constexpr int kPuppetCount = 4;
+struct Puppet {
+    Actor* actor;
+    int lastSeenTick;
+    Vec3f lastPos[kPuppetLimbs]; // world, clean animated pose from last draw
+    u8 posValid[kPuppetLimbs];
+    Vec3f offset[kPuppetLimbs]; // translation applied to the limb matrix at draw
+    Vec3f rotOff[kPuppetLimbs]; // world axis*angle rotation about the limb's own joint
+};
+Puppet sPuppets[kPuppetCount] = {};
+int sPuppetTick = 0;
+bool sWarpActive = false;
+MtxF sWarpSavedMtx;
+
+// Rotate world-space vector v by axis-angle w (Rodrigues).
+inline Vec3f RotateAxisAngle(const Vec3f& v, const Vec3f& w) {
+    const float angle = sqrtf(w.x * w.x + w.y * w.y + w.z * w.z);
+    if (angle < 1e-4f) {
+        return v;
+    }
+    const Vec3f k = vscale(w, 1.0f / angle);
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const Vec3f kxv = vcross(k, v);
+    const float kdv = vdot(k, v);
+    return vadd(vadd(vscale(v, c), vscale(kxv, s)), vscale(k, kdv * (1.0f - c)));
+}
+
+Puppet* FindPuppet(Actor* actor) {
+    for (Puppet& p : sPuppets) {
+        if (p.actor == actor) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+void EnsurePuppet(Actor* actor) {
+    if (FindPuppet(actor) != nullptr) {
+        return;
+    }
+    // Claim the stalest slot (never-seen slots have lastSeenTick 0 and win).
+    Puppet* best = &sPuppets[0];
+    for (Puppet& p : sPuppets) {
+        if (p.lastSeenTick < best->lastSeenTick) {
+            best = &p;
+        }
+    }
+    memset(best, 0, sizeof(*best));
+    best->actor = actor;
+    best->lastSeenTick = sPuppetTick;
+}
+
+// Kick the limbs near a hit: an instant offset impulse through the same puppet channel,
+// decaying via the normal spring-back. This IS the hit reaction.
+void PuppetHitKick(Actor* victim, const Vec3f& hitPos, const Vec3f& dir, float strength) {
+    Puppet* p = FindPuppet(victim);
+    if (p == nullptr) {
+        return;
+    }
+    for (int i = 0; i < kPuppetLimbs; i++) {
+        if (!p->posValid[i]) {
+            continue;
+        }
+        const float dist = vdist(p->lastPos[i], hitPos);
+        float fall = 1.0f - dist / 75.0f;
+        fall = fall < 0.0f ? 0.0f : fall;
+        fall = 0.3f + 0.7f * fall;
+        p->offset[i] = vadd(p->offset[i], vscale(dir, strength * fall));
+    }
+}
+
+// Knockback / press-push impulses queued at draw time and applied during the player's UPDATE:
+// the collision system zeroes every actor's displacement in the damage pass at the top of the
+// tick (CollisionCheck_ResetDamage), so a displacement written at draw time is wiped before
+// the victim ever consumes it. Written from the player's update, it lands the same tick
+// (players update before enemies) AFTER the reset. Pointers validated against the live actor
+// lists before use.
+struct PendingImpulse {
+    Actor* actor;
+    Vec3f d;
+};
+PendingImpulse sImpulses[8] = {};
+int sImpulseCount = 0;
+
+void QueueImpulse(Actor* victim, float dx, float dz) {
+    for (int i = 0; i < sImpulseCount; i++) {
+        if (sImpulses[i].actor == victim) {
+            sImpulses[i].d.x += dx;
+            sImpulses[i].d.z += dz;
+            return;
+        }
+    }
+    if (sImpulseCount < 8) {
+        sImpulses[sImpulseCount].actor = victim;
+        sImpulses[sImpulseCount].d = { dx, 0.0f, dz };
+        sImpulseCount++;
+    }
+}
+
+// The per-tick puppet solve: every recorded limb vs the blade segment. Called from FeedMelee
+// with the effective (sim) blade endpoints, world units.
+void PuppetSolve(const Vec3f& base, const Vec3f& tip) {
+    const float limbR = CVarGetFloat("gVrPhysLimbRadius", 9.0f);
+    const float bladeR = CVarGetFloat("gVrPhysBladeThickness", 0.4f) + 1.5f;
+    const float maxPush = CVarGetFloat("gVrPhysLimbPushMax", 22.0f);
+    const Vec3f bladeDir = vnorm(vsub(tip, base));
+    const float bladeLen = vdist(base, tip);
+    for (Puppet& p : sPuppets) {
+        if (p.actor == nullptr || p.lastSeenTick != sPuppetTick) {
+            continue; // only actors the contact gather validated THIS tick
+        }
+        for (int i = 0; i < kPuppetLimbs; i++) {
+            if (!p.posValid[i]) {
+                continue;
+            }
+            float t = vdot(vsub(p.lastPos[i], base), bladeDir);
+            t = t < 0.0f ? 0.0f : (t > bladeLen ? bladeLen : t);
+            const Vec3f onBlade = vadd(base, vscale(bladeDir, t));
+            const Vec3f d = vsub(p.lastPos[i], onBlade);
+            const float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+            const float pen = (limbR + bladeR) - dist;
+            Vec3f target = { 0.0f, 0.0f, 0.0f };
+            Vec3f rotTarget = { 0.0f, 0.0f, 0.0f };
+            if (pen > 0.0f && dist > 1e-3f) {
+                const float push = pen > maxPush ? maxPush : pen;
+                const Vec3f pushDir = vscale(d, 1.0f / dist);
+                target = vscale(pushDir, push);
+                // Articulation: the limb also ROTATES about its joint, tilting away around
+                // the axis perpendicular to (bone direction x push). Bone direction is
+                // approximated from the neighbouring limb (skeleton arrays are parent-child
+                // ordered); lever = bone length.
+                Vec3f boneDir = { 0.0f, 0.0f, 0.0f };
+                float lever = 12.0f;
+                if (i + 1 < kPuppetLimbs && p.posValid[i + 1]) {
+                    const Vec3f toNext = vsub(p.lastPos[i + 1], p.lastPos[i]);
+                    const float ln = sqrtf(toNext.x * toNext.x + toNext.y * toNext.y + toNext.z * toNext.z);
+                    if (ln > 3.0f && ln < 40.0f) {
+                        boneDir = vscale(toNext, 1.0f / ln);
+                        lever = ln;
+                    }
+                }
+                if (boneDir.x == 0.0f && boneDir.y == 0.0f && boneDir.z == 0.0f && i > 0 &&
+                    p.posValid[i - 1]) {
+                    const Vec3f fromPrev = vsub(p.lastPos[i], p.lastPos[i - 1]);
+                    const float lp = sqrtf(fromPrev.x * fromPrev.x + fromPrev.y * fromPrev.y +
+                                           fromPrev.z * fromPrev.z);
+                    if (lp > 3.0f && lp < 40.0f) {
+                        boneDir = vscale(fromPrev, 1.0f / lp);
+                        lever = lp;
+                    }
+                }
+                if (boneDir.x != 0.0f || boneDir.y != 0.0f || boneDir.z != 0.0f) {
+                    const Vec3f axis = vcross(boneDir, pushDir);
+                    const float axisLen = sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+                    if (axisLen > 0.1f) {
+                        float angle = push / lever; // rad: displacement over the bone lever
+                        const float maxAngle = 0.7f;
+                        angle = angle > maxAngle ? maxAngle : angle;
+                        rotTarget = vscale(vscale(axis, 1.0f / axisLen), angle);
+                    }
+                }
+            }
+            // Resistance: limbs fight the blade — they yield only partially and lag behind
+            // the push, while spring-back to the animation stays firm. 0 = ragdoll-loose,
+            // 1 = barely movable.
+            const float resist = CVarGetFloat("gVrPhysLimbResist", 0.5f);
+            if (pen > 0.0f) {
+                target = vscale(target, 1.0f - 0.5f * resist);
+                rotTarget = vscale(rotTarget, 1.0f - 0.5f * resist);
+            }
+            const float k = (pen > 0.0f) ? (0.15f + 0.45f * (1.0f - resist)) : 0.35f;
+            p.offset[i] = vadd(p.offset[i], vscale(vsub(target, p.offset[i]), k));
+            p.rotOff[i] = vadd(p.rotOff[i], vscale(vsub(rotTarget, p.rotOff[i]), k));
+        }
+    }
+}
+
 // Physical blade outline for the overlay (world units): rootA, cornerA, tip, cornerB, rootB —
 // the flat rectangle the solver actually collides, with its tapered point.
 float sDebugBlade[5][3];
@@ -181,6 +368,26 @@ float BladeLengthModelUnits(Player* player) {
         default:
             return 3000.0f;
     }
+}
+
+// Closest point on segment a0a1 to segment b0b1 (returned point lies on the FIRST segment).
+inline Vec3f ClosestOnSegToSeg(const Vec3f& a0, const Vec3f& a1, const Vec3f& b0, const Vec3f& b1) {
+    const Vec3f d1 = vsub(a1, a0);
+    const Vec3f d2 = vsub(b1, b0);
+    const Vec3f r = vsub(a0, b0);
+    const float A = vdot(d1, d1), E = vdot(d2, d2), F = vdot(d2, r), C = vdot(d1, r);
+    float s = 0.0f;
+    if (A > 1e-9f) {
+        if (E > 1e-9f) {
+            const float B = vdot(d1, d2);
+            const float denom = A * E - B * B;
+            s = (denom > 1e-9f) ? (B * F - C * E) / denom : 0.0f;
+        } else {
+            s = -C / A;
+        }
+        s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+    }
+    return vadd(a0, vscale(d1, s));
 }
 
 inline Vec3f rotY(const Vec3f& v, float rad) {
@@ -480,13 +687,58 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
         const bool hard = (col->acFlags & AC_HARD) != 0;
         const bool enemyBody =
             (col->actor->category == ACTORCAT_ENEMY) || (col->actor->category == ACTORCAT_BOSS);
-        if (!hard && !enemyBody) {
+        const bool npcBody = col->actor->category == ACTORCAT_NPC;
+        if (!hard && !enemyBody && !npcBody) {
             continue;
         }
         if (Math_Vec3f_DistXYZ(&col->actor->world.pos, &player->actor.world.pos) > 400.0f) {
             continue;
         }
         const int primId = hard ? PrimId(kPrimKindHard, col->colType) : PrimId(kPrimKindFlesh, 0);
+
+        // M3: enemies are PUSHED by the blade pressing on them (not just struck). When the
+        // blade surface is within a couple of units of the enemy's collider surface, feed the
+        // one-tick displacement channel — the same post-update positional impulse vanilla
+        // collision pushes use, so enemy AI and animations stay untouched. Mass-scaled,
+        // ground-plane only; heavies and immovables don't budge.
+        auto pressPush = [&](const Vec3f& surfCenter, float surfRadius) {
+            // Enemies only: NPCs' limbs react but their bodies stay planted.
+            if (!enemyBody || hard || col->actor->category == ACTORCAT_BOSS) {
+                return;
+            }
+            const Vec3f bladeDir = vnorm(vsub(tip, base));
+            const float bladeLen = vdist(base, tip);
+            float t = vdot(vsub(surfCenter, base), bladeDir);
+            t = t < 0.0f ? 0.0f : (t > bladeLen ? bladeLen : t);
+            const Vec3f closest = vadd(base, vscale(bladeDir, t));
+            Vec3f away3 = vsub(surfCenter, closest);
+            const float d3 = sqrtf(away3.x * away3.x + away3.y * away3.y + away3.z * away3.z);
+            const float bladeR = CVarGetFloat("gVrPhysBladeThickness", 0.4f);
+            const float reach = surfRadius + bladeR + 2.0f;
+            if (d3 < 1e-3f || d3 > reach) {
+                return; // blade surface not actually pressing the collider surface
+            }
+            Vec3f away = { away3.x, 0.0f, away3.z };
+            const float d = sqrtf(away.x * away.x + away.z * away.z);
+            if (d > 1e-3f) {
+                const float push = CVarGetFloat("gVrPhysPressPush", 2.5f);
+                // Queued: written here (draw time) it would be zeroed before consumption.
+                QueueImpulse(col->actor, (away.x / d) * push, (away.z / d) * push);
+            }
+
+            // Limb-level press deformation is handled by the puppet solve (PuppetSolve),
+            // which pushes individual limbs off the blade continuously.
+        };
+
+        // Track this body as a puppet: its limbs become directly manipulable by the blade.
+        if ((enemyBody || npcBody) && !hard && col->actor->category != ACTORCAT_BOSS) {
+            EnsurePuppet(col->actor);
+            Puppet* pp = FindPuppet(col->actor);
+            if (pp != nullptr) {
+                pp->lastSeenTick = sPuppetTick;
+            }
+        }
+
         if (col->shape == COLSHAPE_CYLINDER) {
             ColliderCylinder* cyl = (ColliderCylinder*)col;
             if (cyl->dim.radius <= 0) {
@@ -502,6 +754,8 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
             pr.b[2] = pr.a[2];
             pr.radius = (float)cyl->dim.radius;
             pr.id = primId;
+            const Vec3f cylMid = { pr.a[0], pr.a[1] + (float)cyl->dim.height * 0.5f, pr.a[2] };
+            pressPush(cylMid, pr.radius);
         } else if (col->shape == COLSHAPE_JNTSPH) {
             ColliderJntSph* jntSph = (ColliderJntSph*)col;
             for (int e = 0; e < jntSph->count && n < VR_PHYS_MAX_CONTACT_PRIMS; e++) {
@@ -517,6 +771,46 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
                 pr.b[0] = pr.b[1] = pr.b[2] = 0.0f;
                 pr.radius = (float)el->dim.worldSphere.radius;
                 pr.id = primId;
+                const Vec3f sphC = { pr.a[0], pr.a[1], pr.a[2] };
+                pressPush(sphC, pr.radius);
+            }
+        }
+    }
+
+    // NPCs never register AC colliders (they're bump-only, OC list) — gather them from there
+    // so friendly bodies are solid to the blade and puppet-able. Enemies were handled above.
+    for (int i = 0; i < colChk->colOCCount && n < VR_PHYS_MAX_CONTACT_PRIMS; i++) {
+        Collider* col = colChk->colOC[i];
+        if (col == NULL || col->actor == NULL || col->actor->category != ACTORCAT_NPC ||
+            col->shape != COLSHAPE_CYLINDER) {
+            continue;
+        }
+        if (Math_Vec3f_DistXYZ(&col->actor->world.pos, &player->actor.world.pos) > 400.0f) {
+            continue;
+        }
+        // NO contact prim for NPCs: their bump cylinder is far fatter than the visible body,
+        // and pushing it makes an invisible barrel the blade can't enter. In visual-mesh mode
+        // the RENDERED body already collides at mesh precision, and the limb puppetry works
+        // directly on recorded limb positions — no prim needed. NPCs also stay planted: no
+        // press nudge, no hit knockback (townsfolk, not combatants).
+        EnsurePuppet(col->actor);
+        Puppet* pp = FindPuppet(col->actor);
+        if (pp != nullptr) {
+            pp->lastSeenTick = sPuppetTick;
+        }
+    }
+
+    // Pacified (frozen) enemies never run their update, so they stop registering AC colliders
+    // and would fall out of the puppet set — track them straight from the actor list instead.
+    if (CVarGetInteger("gVrPhysPacifist", 0)) {
+        for (Actor* a = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; a != NULL; a = a->next) {
+            if (Math_Vec3f_DistXYZ(&a->world.pos, &player->actor.world.pos) > 400.0f) {
+                continue;
+            }
+            EnsurePuppet(a);
+            Puppet* pp = FindPuppet(a);
+            if (pp != nullptr) {
+                pp->lastSeenTick = sPuppetTick;
             }
         }
     }
@@ -729,7 +1023,7 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
             // Collider roll: rotate the flat plane about the blade axis (degrees). The model's
             // width axis isn't guaranteed to match the visual flat of every sword — tune with
             // the debug outline visible until the cyan rectangle lies in the blade's plane.
-            const float rollDeg = CVarGetFloat("gVrPhysBladeRoll", 0.0f);
+            const float rollDeg = CVarGetFloat("gVrPhysBladeRoll", -90.0f);
             if (rollDeg != 0.0f) {
                 const Vec3f axis = vnorm(vsub(tipLocal0, baseLocal0));
                 const float half = rollDeg * (3.14159265f / 180.0f) * 0.5f;
@@ -743,12 +1037,32 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
             const float taper = CVarGetFloat("gVrPhysBladeTipTaper", 0.2f);
             desc.tipTaperFrac = taper;
 
+            // Collider position adjustment (game units, blade-local frame): shift the whole
+            // physical rectangle along the blade / across the edge / through the flat until
+            // it sits exactly on the visible steel. Applies to the collider and the debug
+            // outline (which is the alignment tool), never to the damage quads.
+            const Vec3f fwdDir = vnorm(vsub(tipLocal0, baseLocal0));
+            const Vec3f widthDir = vnorm(widthLocal0);
+            const Vec3f flatDir = vnorm(vcross(fwdDir, widthDir));
+            const Vec3f colShift =
+                vadd(vadd(vscale(fwdDir, CVarGetFloat("gVrPhysBladeShiftFwd", 0.0f) * 100.0f),
+                          vscale(widthDir, CVarGetFloat("gVrPhysBladeShiftEdge", 0.0f) * 100.0f)),
+                     vscale(flatDir, CVarGetFloat("gVrPhysBladeShiftFlat", 0.0f) * 100.0f));
+            const Vec3f baseAdj = vadd(baseLocal0, colShift);
+            const Vec3f tipAdj = vadd(tipLocal0, colShift);
+            desc.gripLocalRootM[0] = baseAdj.x / worldScale;
+            desc.gripLocalRootM[1] = baseAdj.y / worldScale;
+            desc.gripLocalRootM[2] = baseAdj.z / worldScale;
+            desc.gripLocalTipM[0] = tipAdj.x / worldScale;
+            desc.gripLocalTipM[1] = tipAdj.y / worldScale;
+            desc.gripLocalTipM[2] = tipAdj.z / worldScale;
+
             // Overlay copy of the exact physical rectangle (world units, effective pose).
             const Q4 effQ = { effQuatArr[0], effQuatArr[1], effQuatArr[2], effQuatArr[3] };
-            const Vec3f taperLocal = vadd(baseLocal0, vscale(vsub(tipLocal0, baseLocal0), 1.0f - taper));
-            const Vec3f pts[5] = { vadd(baseLocal0, widthLocal0), vadd(taperLocal, widthLocal0),
-                                   tipLocal0, vsub(taperLocal, widthLocal0),
-                                   vsub(baseLocal0, widthLocal0) };
+            const Vec3f taperLocal = vadd(baseAdj, vscale(vsub(tipAdj, baseAdj), 1.0f - taper));
+            const Vec3f pts[5] = { vadd(baseAdj, widthLocal0), vadd(taperLocal, widthLocal0),
+                                   tipAdj, vsub(taperLocal, widthLocal0),
+                                   vsub(baseAdj, widthLocal0) };
             for (int i = 0; i < 5; i++) {
                 const Vec3f w = vadd(effPos, qrot(effQ, pts[i]));
                 sDebugBlade[i][0] = w.x;
@@ -777,6 +1091,9 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
         desc.maxAccelMps2 = CVarGetFloat("gVrPhysMaxAccel", 400.0f);
         VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, &desc);
         PushContactPrims(play, player, base0, tip0);
+        // Solve the blade against every tracked puppet's limbs (recorded during last draw):
+        // limbs the blade intrudes on get pushed out and ride it; released limbs spring back.
+        PuppetSolve(base0, tip0);
     } else {
         VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, NULL);
         VR_PhysSetContactPrims(NULL, 0);
@@ -908,6 +1225,48 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
 namespace VrCombat {
 
 void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
+    // Pacifist testing mode: refresh every enemy's freezeTimer so their updates never run —
+    // no AI, no detection, no attacks, animation paused. Uncheck and they thaw in a tick.
+    if (CVarGetInteger("gVrPhysPacifist", 0)) {
+        for (Actor* a = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; a != NULL; a = a->next) {
+            a->freezeTimer = 2;
+        }
+    }
+
+    // New puppet tick: the contact gather re-marks live puppets during this tick's draw, and
+    // stale ones (actor gone or out of range) stop being solved or warped.
+    sPuppetTick++;
+    for (Puppet& p : sPuppets) {
+        if (p.actor != nullptr && p.lastSeenTick + 3 < sPuppetTick) {
+            memset(&p, 0, sizeof(p));
+        }
+    }
+
+    // Apply queued impulses. We're inside the player's update: the damage pass (which zeroes
+    // displacement) already ran this tick, and enemies update after the player — so writes
+    // here land this very tick. Victims are validated against the live actor lists first; a
+    // pointer that isn't there anymore (died from the hit that queued this) is dropped.
+    if (sImpulseCount > 0) {
+        static const u8 kCats[] = { ACTORCAT_ENEMY, ACTORCAT_BOSS, ACTORCAT_NPC, ACTORCAT_PROP };
+        for (int i = 0; i < sImpulseCount; i++) {
+            Actor* target = sImpulses[i].actor;
+            bool alive = false;
+            for (size_t c = 0; c < ARRAY_COUNT(kCats) && !alive; c++) {
+                for (Actor* a = play->actorCtx.actorLists[kCats[c]].head; a != NULL; a = a->next) {
+                    if (a == target) {
+                        alive = true;
+                        break;
+                    }
+                }
+            }
+            if (alive) {
+                target->colChkInfo.displacement.x += sImpulses[i].d.x;
+                target->colChkInfo.displacement.z += sImpulses[i].d.z;
+            }
+        }
+        sImpulseCount = 0;
+    }
+
     // Weapon switched to something physical combat doesn't cover: release the sim slot so the
     // hand pose reverts to the raw controller (the draw-time feed only runs for covered weapons).
     if (!VrCombat_MeleeCovered(player)) {
@@ -970,12 +1329,65 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
     // Read back last tick's quad results (the AT pass ran at the top of this tick).
     bool hit = false;
     for (int i = 0; i < sQuadsUsed; i++) {
-        if (sQuads[i].base.atFlags & AT_HIT) {
-            hit = true;
+        if (!(sQuads[i].base.atFlags & AT_HIT)) {
+            continue;
+        }
+        hit = true;
+        // M3 hit feel. Vanilla colChkInfo.mass is IGNORED here: it encodes "Link can't shove
+        // me by walking into me" (a tiny Stalchild carries MASS_HEAVY), not weight. Sword
+        // impacts scale by category instead — full effect on enemies/NPCs, none on bosses.
+        Actor* victim = sQuads[i].base.at;
+        if (victim != NULL && victim->category != ACTORCAT_BOSS) {
+            Vec3f dir = vsub(victim->world.pos, player->actor.world.pos);
+            dir.y = 0.0f;
+            const float dl = sqrtf(dir.x * dir.x + dir.z * dir.z);
+            if (dl > 1e-3f) {
+                dir.x /= dl;
+                dir.z /= dl;
+                // Micro-push, queued: displacement written now would be zeroed by the damage
+                // pass before the victim consumes it — it lands from the player UPDATE instead.
+                // NPCs are exempt: their limbs react but they stay planted.
+                if (victim->category != ACTORCAT_NPC) {
+                    float mag = sTickTipSpeed * CVarGetFloat("gVrPhysKnockbackScale", 1.0f) * 1.5f;
+                    const float cap = CVarGetFloat("gVrPhysKnockbackCap", 8.0f);
+                    if (mag > cap) {
+                        mag = cap;
+                    }
+                    QueueImpulse(victim, dir.x * mag, dir.z * mag);
+                }
+
+                // Punching-bag flinch: skeleton caves toward the swing around the impact
+                // point and springs back. Anchor = the closest point on the CURRENT blade to
+                // the victim's vertical axis — NOT the swept quad's centroid, which spans the
+                // whole swing arc and can land outside the flinch falloff entirely (the bug
+                // that made hit flinch invisible on fast swings).
+                const Vec3f axisA = victim->world.pos;
+                const Vec3f axisB = { victim->world.pos.x, victim->world.pos.y + 80.0f,
+                                      victim->world.pos.z };
+                // Blade endpoints from the last draw's outline snapshot (this readback runs
+                // during the player's update, one tick after the swing registered).
+                Vec3f bladeBase = axisA;
+                Vec3f bladeTip = axisB;
+                if (sDebugBladeValid) {
+                    bladeBase = { (sDebugBlade[0][0] + sDebugBlade[4][0]) * 0.5f,
+                                  (sDebugBlade[0][1] + sDebugBlade[4][1]) * 0.5f,
+                                  (sDebugBlade[0][2] + sDebugBlade[4][2]) * 0.5f };
+                    bladeTip = { sDebugBlade[2][0], sDebugBlade[2][1], sDebugBlade[2][2] };
+                }
+                const Vec3f hitPos = ClosestOnSegToSeg(bladeBase, bladeTip, axisA, axisB);
+                const Vec3f flinchDir = { dir.x, 0.15f, dir.z }; // a touch of lift reads as impact
+                const float speedNorm = sTickTipSpeed / 6.0f;
+                const float strength = CVarGetFloat("gVrPhysFlinchAmount", 18.0f) *
+                                       (0.5f + (speedNorm > 1.0f ? 1.0f : speedNorm) * 0.5f);
+                PuppetHitKick(victim, hitPos, flinchDir, strength);
+            }
         }
     }
     if (hit) {
-        VR_TriggerHaptic(SwordHand(), 0.8f, 0.0f, 60.0f);
+        // Hit feel scales with the swing that landed: a threshold graze taps, a full-arm
+        // heavy swing thumps long and hard.
+        const float amp = 0.45f + 0.09f * sTickTipSpeed;
+        VR_TriggerHaptic(SwordHand(), amp > 1.0f ? 1.0f : amp, 0.0f, 45.0f + 12.0f * sTickTipSpeed);
         if (sTier == TIER_HOT) {
             sTier = TIER_ARMED; // one strike per swing: re-cross the hit speed to strike again
         }
@@ -984,6 +1396,27 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
         Collider_ResetQuadAT(play, &sQuads[i].base);
     }
     sQuadsUsed = 0;
+}
+
+int Swing_GetDebugPuppetLimbs(float* outPos3PerLimb, float* outOffsetMag, int maxLimbs) {
+    int n = 0;
+    for (const Puppet& p : sPuppets) {
+        if (p.actor == nullptr || p.lastSeenTick + 2 < sPuppetTick) {
+            continue;
+        }
+        for (int i = 0; i < kPuppetLimbs && n < maxLimbs; i++) {
+            if (!p.posValid[i]) {
+                continue;
+            }
+            outPos3PerLimb[n * 3 + 0] = p.lastPos[i].x;
+            outPos3PerLimb[n * 3 + 1] = p.lastPos[i].y;
+            outPos3PerLimb[n * 3 + 2] = p.lastPos[i].z;
+            const Vec3f& o = p.offset[i];
+            outOffsetMag[n] = sqrtf(o.x * o.x + o.y * o.y + o.z * o.z);
+            n++;
+        }
+    }
+    return n;
 }
 
 int Swing_GetDebugBladeOutline(float* outPts5x3) {
@@ -1034,3 +1467,73 @@ void Swing_Deactivate(PlayState* play, Player* player) {
 }
 
 } // namespace VrCombat
+
+// ---- Hit-flinch limb warp (called from z_skelanime.c around every limb matrix conversion) ----
+// Begin: if `actorArg` has a live flinch, offset the current matrix's translation by the hit
+// direction, scaled by the envelope and by how close this limb is to the impact point. End:
+// restore, so child limbs build from the clean hierarchy and get their own falloff-weighted
+// offsets — the skeleton caves locally around the hit and springs back.
+extern "C" void VrCombat_FlinchWarpBegin(PlayState* play, void* actorArg, int32_t limbIndex) {
+    (void)play;
+    if (sWarpActive || actorArg == NULL) {
+        return;
+    }
+    // Diagnostic lever: gVrPhysFlinchTest <units> lifts EVERY enemy/NPC limb, bypassing the
+    // puppet system — splits "warp pipeline broken" from "puppet solve broken".
+    const int test = CVarGetInteger("gVrPhysFlinchTest", 0);
+    if (test != 0) {
+        Actor* a = (Actor*)actorArg;
+        if (a->category == ACTORCAT_ENEMY || a->category == ACTORCAT_NPC) {
+            MtxF* cm = Matrix_GetCurrent();
+            sWarpSavedMtx = *cm;
+            cm->yw += (float)test;
+            sWarpActive = true;
+            return;
+        }
+    }
+    Puppet* p = FindPuppet((Actor*)actorArg); // pointer compare only
+    if (p == nullptr || limbIndex < 0 || limbIndex >= kPuppetLimbs) {
+        return;
+    }
+    MtxF* cm = Matrix_GetCurrent();
+    // Record the clean animated pose BEFORE offsetting: the contact solve must see where the
+    // animation put the limb, not where we displaced it (no feedback loops).
+    p->lastPos[limbIndex] = { cm->xw, cm->yw, cm->zw };
+    p->posValid[limbIndex] = 1;
+    const Vec3f& off = p->offset[limbIndex];
+    const Vec3f& rot = p->rotOff[limbIndex];
+    const float offMag2 = off.x * off.x + off.y * off.y + off.z * off.z;
+    const float rotMag2 = rot.x * rot.x + rot.y * rot.y + rot.z * rot.z;
+    if (offMag2 < 0.0001f && rotMag2 < 0.00001f) {
+        return;
+    }
+    sWarpSavedMtx = *cm;
+    sWarpActive = true;
+    // Rotate the limb about its own joint (world-axis rotation of the basis columns; the
+    // joint position stays put), then translate.
+    if (rotMag2 >= 0.00001f) {
+        const Vec3f bx = RotateAxisAngle({ cm->xx, cm->yx, cm->zx }, rot);
+        const Vec3f by = RotateAxisAngle({ cm->xy, cm->yy, cm->zy }, rot);
+        const Vec3f bz = RotateAxisAngle({ cm->xz, cm->yz, cm->zz }, rot);
+        cm->xx = bx.x;
+        cm->yx = bx.y;
+        cm->zx = bx.z;
+        cm->xy = by.x;
+        cm->yy = by.y;
+        cm->zy = by.z;
+        cm->xz = bz.x;
+        cm->yz = bz.y;
+        cm->zz = bz.z;
+    }
+    cm->xw += off.x;
+    cm->yw += off.y;
+    cm->zw += off.z;
+}
+
+extern "C" void VrCombat_FlinchWarpEnd(void) {
+    if (!sWarpActive) {
+        return;
+    }
+    *Matrix_GetCurrent() = sWarpSavedMtx;
+    sWarpActive = false;
+}
