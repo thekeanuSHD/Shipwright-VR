@@ -33,8 +33,10 @@ animation-driven enemies), GORN/Blade & Sorcery (limb manipulation).
 ### Layer 0 — libultraship sim (`libultraship/src/fast/vr_physics.cpp`, headset rate)
 
 Self-contained held-object simulation in RAW tracking space (meters), stepped per XR frame
-from `vr_begin_frame`. C ABI in `include/vr_interface.h`, **interface version 12** (asserted
-game-side at init; bump on any struct change).
+from `vr_begin_frame`. C ABI in `include/vr_interface.h`, **interface version 13** (asserted
+game-side at init; bump on any struct change). Contact-prim channel holds 48; capsule/sphere
+prims get a continuous closest-pair contact in the solver (point samples alone let a thin
+bone capsule slip between them).
 
 - **Position-based solver, not impulses**: a spring-damper (implicit/backward-Euler,
   unconditionally stable) drives a collision-free TARGET pose; the blade walks toward it in
@@ -72,8 +74,9 @@ game-side at init; bump on any struct change).
   DLs and crashes): w1 = 0 unmask / 1 mask / 2 flesh-material on / 3 flesh off. Masked:
   player's own model, sword trail (EffectBlure), debug overlay, in-world lock-on
   reticle/arrow (`Attention_Draw`), ITEMACTION+MISC actors (Navi, sparkles, pickups).
-  Depth-write is required for harvest (kills particles/glows/water generically). Enemy/NPC/BOSS
-  actor draws are bracketed as FLESH → silent contacts, no sparks.
+  Depth-write is required for harvest (kills particles/glows/water generically). Enemy and NPC
+  draws are MASKED (they collide as bone capsules instead — see Layer 1); only BOSS draws are
+  bracketed as FLESH → silent contacts, no sparks.
 - **Flight recorder**: `gVrPhysLog` + menu button dumps per-step CSV
   (`x64/Debug/vr_phys_log.csv`); `tools/vrphys-suite/analyze_log.py` attributes jitter
   (spring vs contacts vs discovery churn).
@@ -85,10 +88,13 @@ game-side at init; bump on any struct change).
 - `VrSwing.cpp` — everything melee: swing tiers (blade-midpoint speed from runtime-filtered
   velocities + min hand speed floor), swept damage quads + strike quads, contact gathering
   (scene polys with back-face rejection & sticky ranking [collision-mesh mode only], dyna
-  probes, AC_HARD; enemy BODY capsules/spheres are pushed in collision-mesh mode only —
-  visual-mesh mode leaves bodies solid via the harvested visible model, so pressing follows
-  what the player sees instead of the fat invisible AC cylinder; damage quads still hit the
-  real colliders), material impact SFX, knockback/press impulses
+  probes, AC_HARD; living BODIES collide as **bone capsules** fitted to the skeleton the
+  puppet system records — the nearest 20 plausible limb pairs (length gate 3-40) as
+  flesh-material capsules, radius `gVrPhysBodyCapsuleRadius`, built from the CLEAN animated
+  pose so puppet yielding can't feed back; enemies/NPCs are masked out of the visual-mesh
+  harvest entirely because their unsealed multi-shell render meshes churn the contact set —
+  that WAS the enemy-jitter bug; actors with no recorded skeleton fall back to their AC prim;
+  damage quads still hit the real colliders), material impact SFX, knockback/press impulses
   (QUEUED at draw, applied in the player's update — displacement written at draw time is
   zeroed by the damage pass before consumption; vanilla `colChkInfo.mass` is IGNORED — it
   means "can't be walk-pushed", a Stalchild is MASS_HEAVY), **limb puppet system** (below),
@@ -141,7 +147,7 @@ MaxAngAccel 3000 / TouchTolerance 0.3 / Friction 0.3 / PivotOnly 1
 by the position-based sim.)
 Feel: PassthroughSpeed 2.2 / CutDragFlesh 0.55 / CutDragWorld 0.2 / KnockbackScale 1.0 /
 KnockbackCap 8.0 / PressPush 2.5 / FlinchAmount 18 / LimbResist 0.5 / LimbRadius 9 /
-LimbPushMax 22 / MeshRadius 150
+LimbPushMax 22 / MeshRadius 150 / BodyCapsuleRadius 4.5
 Debug: `gVrPhysFlinchTest` 0 (console only; N = lift all limbs N units) / `gVrPhysLog` 0
 
 ## Testing methodology (IMPORTANT — this is how every physics bug here got solved)
@@ -180,6 +186,12 @@ quads = damage quads.
   otherwise; fix pending.
 - `Boss_Sst` (Bongo hand) walks its joint table up to 4× per draw — puppet warp is
   save/restore idempotent so it's safe, but remember if changing the warp to additive.
+- Bone capsules use consecutive-index limb pairs; a depth-first sibling jump inside the
+  length gate makes an occasional phantom bone (e.g. bridging across the torso) — mostly
+  harmless (inside the body). Exact fix if needed: read the skeleton's real child/sibling
+  links. Capsules also step at the 20 Hz game tick while the rendered mesh interpolates at
+  headset rate — same cadence AC prims always had; interpolating capsule endpoints in the
+  sim is the refinement if a resting blade reads as stepping on walking enemies.
 - Build: `--parallel 6` normally; C1060 "out of heap space" = machine memory pressure (game
   + SteamVR running) — check free RAM, retry, or drop to `--parallel 2`. LNK1168 = game still
   running. Touching `gbi.h`/`interpreter.h` = near-full rebuild.

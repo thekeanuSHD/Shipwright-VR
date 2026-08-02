@@ -456,6 +456,131 @@ static int RunMeshStereoCase() {
     return vrphys_mesh_get_debug_tris(tribuf, 32); // unique tris that reached the solver
 }
 
+// --------------------------------------------------------------------------
+// Bone-capsule scenarios: enemies/NPCs collide as capsules fitted to their skeletons (their
+// render meshes are unsealed multi-shell tri soup that churns the contact set). The cases
+// that matter: resting in the crease where two bones meet, a limb that MOVES under the blade
+// at game-tick cadence, and a thin bone crossing the blade between its point samples.
+// --------------------------------------------------------------------------
+
+static VrPhysContactPrim MakeCapsule(float ax, float ay, float az, float bx, float by, float bz,
+                                     float radius) {
+    VrPhysContactPrim p{};
+    p.type = VRPHYS_PRIM_CAPSULE;
+    p.a[0] = ax; p.a[1] = ay; p.a[2] = az;
+    p.b[0] = bx; p.b[1] = by; p.b[2] = bz;
+    p.radius = radius;
+    p.id = 3 << 12; // flesh
+    return p;
+}
+
+// mode 0: ELBOW — blade pressed down into the crease of two bones meeting at a joint.
+// mode 1: MOVING limb — bone oscillates +-2 units at 1.2 Hz, re-pushed every 4th step (the
+//         20 Hz game tick); blade held pressed onto it. Some motion is BY DESIGN (the surface
+//         moves); the failure modes are ringing and contact dropout.
+// mode 2: THIN bone (radius 1.5) crossing the blade mid-span, between point samples — only
+//         the continuous closest-pair contact can catch it.
+static Result RunCapsuleCase(int mode) {
+    vrphys_reset();
+    const float turn[4] = { 0, 0, 0, 1 };
+    const float turnOff[3] = { 0, 0, 0 };
+    const float anchor[3] = { 0, 0, 0 };
+
+    VrPhysObjectDesc desc = MeshCaseDesc();
+    vrphys_set_object(VRPHYS_SLOT_WEAPON, &desc);
+
+    auto pushPrims = [&](float yoff) {
+        VrPhysContactPrim prims[2];
+        int np = 0;
+        if (mode == 0) {
+            prims[np++] = MakeCapsule(20, 0, -30, 38, 0, 0, 4.0f);
+            prims[np++] = MakeCapsule(38, 0, 0, 20, 0, 30, 4.0f);
+        } else if (mode == 1) {
+            prims[np++] = MakeCapsule(35, yoff, -30, 35, yoff, 30, 4.0f);
+        } else {
+            prims[np++] = MakeCapsule(15, 0, -30, 15, 0, 30, 1.5f);
+        }
+        vrphys_set_contact_prims(prims, np);
+    };
+    pushPrims(0.0f);
+
+    const float dt = 1.0f / 90.0f;
+    uint64_t t = 0;
+    // All modes: start clear above the bone(s) and press down; the press ends well below the
+    // rest height so the blade stays loaded for the whole measurement window.
+    float hy = (mode == 0) ? 0.35f : 0.15f;
+    const float hyEnd = (mode == 0) ? -0.10f : ((mode == 1) ? -0.02f : -0.08f);
+    const int pressSteps = 90;
+    const float hyStep = (hyEnd - hy) / (float)pressSteps;
+
+    Result r{ 0, 0, 99, 0, 0, 0.0f };
+    float prev[3] = { 0, 0, 0 };
+    float pd[3] = { 0, 0, 0 };
+    bool haveD = false, havePrev = false;
+    double sum = 0;
+    int samples = 0;
+
+    for (int step = 0; step < 300; step++) {
+        if (step < pressSteps) {
+            hy += hyStep;
+        }
+        if (mode == 1 && (step % 4) == 0) { // 20 Hz game tick: the limb animates
+            pushPrims(2.0f * sinf(2.0f * 3.14159265f * 1.2f * (float)step * dt));
+        }
+        const float pos[3] = { 0.0f, hy, 0.0f };
+        const float quat[4] = { 0, 0, 0, 1 };
+        const float lin[3] = { 0.0f, (step < pressSteps) ? hyStep / dt : 0.0f, 0.0f };
+        const float ang[3] = { 0, 0, 0 };
+        t += (uint64_t)(dt * 1e9f);
+        vrphys_push_hand_sample(1, pos, quat, lin, ang, true, t);
+        vrphys_step(dt, turn, turnOff, anchor, kScale, true);
+
+        float opos[3], oq[4], ov[3], oa[3];
+        vrphys_get_object_pose(VRPHYS_SLOT_WEAPON, opos, oq, ov, oa);
+        float cp[12], cn[12];
+        const int nc = vrphys_get_object_contacts(VRPHYS_SLOT_WEAPON, cp, cn, 4);
+
+        // Pivot-only nails the GRIP to the (stationary) hand — the whole response is
+        // rotation, so measure the TIP, where capsule contact actually shows.
+        const float qx = oq[0], qy = oq[1], qz = oq[2], qw = oq[3];
+        const float ty2 = 2.0f * (qz * 1.0f), tz2 = 2.0f * (-qy * 1.0f); // 2*(qv x +x)
+        const float dxr = 1.0f + qw * 0.0f + (qy * tz2 - qz * ty2);
+        const float dyr = qw * ty2 + (qz * 0.0f - qx * tz2);
+        const float dzr = qw * tz2 + (qx * ty2 - qy * 0.0f);
+        const float tipP[3] = { opos[0] + dxr * 1.13f * kScale, opos[1] + dyr * 1.13f * kScale,
+                                opos[2] + dzr * 1.13f * kScale };
+
+        if (havePrev && step > 20) {
+            const float dx = (tipP[0] - prev[0]) / kScale;
+            const float dy = (tipP[1] - prev[1]) / kScale;
+            const float dz = (tipP[2] - prev[2]) / kScale;
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz) * 1000.0f;
+            if (d > r.maxStepMm) {
+                r.maxStepMm = d;
+            }
+            if (haveD) {
+                const float jx = dx - pd[0], jy = dy - pd[1], jz = dz - pd[2];
+                const float j = sqrtf(jx * jx + jy * jy + jz * jz) * 1000.0f;
+                if (step >= 150) {
+                    sum += j;
+                    samples++;
+                }
+            }
+            pd[0] = dx; pd[1] = dy; pd[2] = dz;
+            haveD = true;
+        }
+        if (step >= 120) {
+            if (nc < r.minContacts) r.minContacts = nc;
+            if (nc > r.maxContacts) r.maxContacts = nc;
+            if (nc == 0) r.zeroContactSteps++;
+        }
+        havePrev = true;
+        for (int i = 0; i < 3; i++) prev[i] = tipP[i];
+    }
+    r.heldJitterMm = (float)(sum / (samples ? samples : 1));
+    return r;
+}
+
 int main() {
     struct Case {
         const char* name;
@@ -514,6 +639,24 @@ int main() {
     const int stereoUniq = RunMeshStereoCase();
     printf("  stereo duplicate harvest     | unique tris reaching solver %d/24 (expect 24)\n",
            stereoUniq);
+
+    printf("\n=== BONE CAPSULES (skeleton-fitted enemy collision) ===\n");
+    {
+        const Result elbow = RunCapsuleCase(0);
+        printf("  elbow crease pressed hold    | HF %7.3f mm | max step %6.2f mm | contacts %d-%d "
+               "| zero-contact %d\n",
+               elbow.heldJitterMm, elbow.maxStepMm, elbow.minContacts, elbow.maxContacts,
+               elbow.zeroContactSteps);
+        const Result moving = RunCapsuleCase(1);
+        printf("  MOVING limb (20 Hz anim)     | HF %7.3f mm | max step %6.2f mm | contacts %d-%d "
+               "| zero-contact %d\n",
+               moving.heldJitterMm, moving.maxStepMm, moving.minContacts, moving.maxContacts,
+               moving.zeroContactSteps);
+        const Result thin = RunCapsuleCase(2);
+        printf("  THIN bone between samples    | HF %7.3f mm | contacts %d-%d | zero-contact %d "
+               "(expect 0)\n",
+               thin.heldJitterMm, thin.minContacts, thin.maxContacts, thin.zeroContactSteps);
+    }
 
     printf("\n=== FRICTION A/B (tip pressed on flat wall, hand drags sideways at 0.36 m/s) ===\n");
     const float frics[] = { 0.0f, 0.15f, 0.3f, 0.6f, 0.9f };

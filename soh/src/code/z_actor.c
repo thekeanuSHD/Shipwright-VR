@@ -2851,14 +2851,15 @@ void Actor_Draw(PlayState* play, Actor* actor) {
     }
 
     // SOH [VR] Companion/effect-class actors (Navi, environmental sparkles, item pickups) are
-    // not physical for the blade: exclude their draws from the visual-mesh harvest. Living
-    // bodies (enemies, NPCs) harvest as FLESH so blade contact is silent instead of sparking
-    // like stone.
+    // not physical for the blade: exclude their draws from the visual-mesh harvest. Enemies
+    // and NPCs are excluded too — they collide as bone capsules fitted to their recorded
+    // skeletons (VrSwing.cpp); their unsealed multi-shell render meshes churn the solver's
+    // contact set (the enemy-jitter bug). Bosses aren't puppet-tracked, so their bodies keep
+    // harvesting as FLESH (silent contact, no stone sparks).
     {
-        s32 vrMeshMasked =
-            (actor->category == ACTORCAT_ITEMACTION) || (actor->category == ACTORCAT_MISC);
-        s32 vrMeshFlesh = (actor->category == ACTORCAT_ENEMY) || (actor->category == ACTORCAT_BOSS) ||
-                          (actor->category == ACTORCAT_NPC);
+        s32 vrMeshMasked = (actor->category == ACTORCAT_ITEMACTION) || (actor->category == ACTORCAT_MISC) ||
+                           (actor->category == ACTORCAT_ENEMY) || (actor->category == ACTORCAT_NPC);
+        s32 vrMeshFlesh = (actor->category == ACTORCAT_BOSS);
         if (vrMeshMasked) {
             VrCombat_MeshMaskPush(play->state.gfxCtx);
         } else if (vrMeshFlesh) {

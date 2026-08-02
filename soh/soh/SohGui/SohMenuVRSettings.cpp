@@ -676,6 +676,19 @@ void SohMenu::AddMenuVRSettings() {
                      .Tooltip("How much limbs fight back against the blade: 0 = ragdoll-loose, "
                               "1 = they barely budge. Limbs lag behind your push and spring "
                               "back firmly."));
+    AddWidget(physPath, "Body Capsule Radius: %.1f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVrPhysBodyCapsuleRadius")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })
+        .Options(FloatSliderOptions()
+                     .Min(1.0f)
+                     .Max(12.0f)
+                     .DefaultValue(4.5f)
+                     .Step(0.1f)
+                     .Format("%.1f")
+                     .Tooltip("Thickness of the invisible capsules fitted to each enemy/NPC "
+                              "skeleton bone - the surfaces the sword actually rests on. Match "
+                              "to limb thickness: too big and the sword floats off bodies, too "
+                              "small and it sinks in before stopping."));
     AddWidget(physPath, "Blade Tip Taper: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrPhysBladeTipTaper")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrPhysBladeInertia", 1); })

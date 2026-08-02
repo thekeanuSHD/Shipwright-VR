@@ -215,6 +215,32 @@ void EnsurePuppet(Actor* actor) {
     best->lastSeenTick = sPuppetTick;
 }
 
+// A "bone" is a consecutive limb pair with a plausible length (skeleton arrays are parent-child
+// ordered; the gate rejects depth-first sibling jumps). Bone capsules built from these are how
+// the blade collides with living bodies.
+constexpr float kBoneMinLen = 3.0f;
+constexpr float kBoneMaxLen = 40.0f;
+constexpr int kMaxBoneCapsules = 20;
+
+// True when this actor's puppet recorded at least one plausible bone last draw — bone-capsule
+// collision covers it, so its fat AC body prim must NOT be pushed (the invisible barrel).
+bool PuppetHasBones(Actor* actor) {
+    Puppet* p = FindPuppet(actor);
+    if (p == nullptr) {
+        return false;
+    }
+    for (int i = 0; i + 1 < kPuppetLimbs; i++) {
+        if (!p->posValid[i] || !p->posValid[i + 1]) {
+            continue;
+        }
+        const float blen = vdist(p->lastPos[i], p->lastPos[i + 1]);
+        if (blen > kBoneMinLen && blen < kBoneMaxLen) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Kick the limbs near a hit: an instant offset impulse through the same puppet channel,
 // decaying via the normal spring-back. This IS the hit reaction.
 void PuppetHitKick(Actor* victim, const Vec3f& hitPos, const Vec3f& dir, float strength) {
@@ -773,11 +799,13 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
             }
         }
 
-        // Bodies are solid via the RENDERED model in visual-mesh mode (harvested as FLESH) —
-        // only AC_HARD stays a prim there. Collision-mesh mode has no harvest, so body prims
-        // are all the blade can rest on and they stay. Press detection and puppet tracking
-        // above run off the AC colliders in both modes regardless.
-        const bool solidPrim = hard || !visualMesh;
+        // Bodies are solid via BONE CAPSULES fitted to their recorded skeletons (appended
+        // after these loops) — pushing the fat AC cylinder/spheres too would wrap them in an
+        // invisible barrel. Actors with no recorded skeleton (no skelanime hooks in their
+        // draw path) fall back to their AC prim so they stay solid. AC_HARD (armor,
+        // carapaces) is always solid with its material identity. Press detection and puppet
+        // tracking above run off the AC colliders regardless.
+        const bool solidPrim = hard || !PuppetHasBones(col->actor);
         if (col->shape == COLSHAPE_CYLINDER) {
             ColliderCylinder* cyl = (ColliderCylinder*)col;
             if (cyl->dim.radius <= 0) {
@@ -860,6 +888,66 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
             if (pp != nullptr) {
                 pp->lastSeenTick = sPuppetTick;
             }
+        }
+    }
+
+    // ---- Bone capsules: how the blade collides with living bodies ----
+    // A capsule per bone, from the limb positions the puppet system already records during
+    // draw. Character render meshes are unsealed multi-shell tri soup that churns the
+    // solver's contact set (the enemy-jitter bug) and the AC colliders are invisible
+    // barrels; skeleton-fitted capsules are smooth, convex and continuous — N64 characters
+    // are practically made of them. Built from the CLEAN animated pose (the same positions
+    // the puppet solve uses): flesh visually yields via the puppet while the body under it
+    // stays firm, so there is no spring-vs-spring feedback. Nearest bones win the budget.
+    {
+        const float boneR = CVarGetFloat("gVrPhysBodyCapsuleRadius", 4.5f);
+        struct BoneCand {
+            float d2;
+            const Vec3f* a;
+            const Vec3f* b;
+        };
+        BoneCand bones[kMaxBoneCapsules];
+        int boneCount = 0;
+        for (Puppet& p : sPuppets) {
+            if (p.actor == nullptr || p.lastSeenTick != sPuppetTick) {
+                continue;
+            }
+            for (int i = 0; i + 1 < kPuppetLimbs; i++) {
+                if (!p.posValid[i] || !p.posValid[i + 1]) {
+                    continue;
+                }
+                const float blen = vdist(p.lastPos[i], p.lastPos[i + 1]);
+                if (blen <= kBoneMinLen || blen >= kBoneMaxLen) {
+                    continue; // consecutive-index sibling jump, not a bone
+                }
+                const Vec3f onBlade = ClosestOnSegToSeg(base, tip, p.lastPos[i], p.lastPos[i + 1]);
+                const float d2 = SegPointDist2(p.lastPos[i], p.lastPos[i + 1], onBlade);
+                if (boneCount < kMaxBoneCapsules) {
+                    bones[boneCount++] = { d2, &p.lastPos[i], &p.lastPos[i + 1] };
+                } else {
+                    int worst = 0;
+                    for (int c = 1; c < kMaxBoneCapsules; c++) {
+                        if (bones[c].d2 > bones[worst].d2) {
+                            worst = c;
+                        }
+                    }
+                    if (d2 < bones[worst].d2) {
+                        bones[worst] = { d2, &p.lastPos[i], &p.lastPos[i + 1] };
+                    }
+                }
+            }
+        }
+        for (int bi = 0; bi < boneCount && n < VR_PHYS_MAX_CONTACT_PRIMS; bi++) {
+            VrContactPrim& pr = prims[n++];
+            pr.type = VR_PHYS_PRIM_CAPSULE;
+            pr.a[0] = bones[bi].a->x;
+            pr.a[1] = bones[bi].a->y;
+            pr.a[2] = bones[bi].a->z;
+            pr.b[0] = bones[bi].b->x;
+            pr.b[1] = bones[bi].b->y;
+            pr.b[2] = bones[bi].b->z;
+            pr.radius = boneR;
+            pr.id = PrimId(kPrimKindFlesh, 0);
         }
     }
 
