@@ -944,7 +944,7 @@ void SohMenu::AddMenuVRSettings() {
         .Options(FloatSliderOptions()
                      .Min(0.0f)
                      .Max(0.97f)
-                     .DefaultValue(0.97f)
+                     .DefaultValue(0.73f)
                      .Step(0.01f)
                      .Format("%.2f")
                      .Tooltip("How much enemy bodies hold the blade back while a fast swing "
@@ -1175,7 +1175,7 @@ void SohMenu::AddMenuVRSettings() {
                      CVarGetFloat("gVrPhysBladeFriction", 0.5f), CVarGetInteger("gVrPhysPivotOnly", 1),
                      CVarGetInteger("gVrPhysVisualMesh", 1), CVarGetFloat("gVrPhysMeshRadius", 150.0f),
                      CVarGetFloat("gVrPhysPassthroughSpeed", 2.2f),
-                     CVarGetFloat("gVrPhysCutDragFlesh", 0.97f),
+                     CVarGetFloat("gVrPhysCutDragFlesh", 0.73f),
                      CVarGetFloat("gVrPhysCutDragWorld", 0.73f),
                      CVarGetFloat("gVrPhysKnockbackScale", 0.0f),
                      CVarGetFloat("gVrPhysKnockbackCap", 8.0f), CVarGetFloat("gVrPhysPressPush", 0.0f),

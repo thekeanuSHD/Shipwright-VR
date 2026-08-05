@@ -1227,7 +1227,7 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
         // Committed swings cut THROUGH instead of snagging; default matches the damage tier
         // ("fast enough to hurt = fast enough to cut through").
         desc.passthroughSpeedMps = CVarGetFloat("gVrPhysPassthroughSpeed", 2.2f);
-        desc.cutDragFlesh = CVarGetFloat("gVrPhysCutDragFlesh", 0.97f);
+        desc.cutDragFlesh = CVarGetFloat("gVrPhysCutDragFlesh", 0.73f);
         desc.cutDragWorld = CVarGetFloat("gVrPhysCutDragWorld", 0.73f);
         desc.angFreqHz = CVarGetFloat("gVrPhysSwordAngFreq", 30.0f);
         desc.maxAccelMps2 = CVarGetFloat("gVrPhysMaxAccel", 400.0f);
