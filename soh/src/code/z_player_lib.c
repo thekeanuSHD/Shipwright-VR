@@ -544,7 +544,9 @@ s32 Player_ActionToModelGroup(Player* this, s32 actionParam) {
 }
 
 void Player_SetModelsForHoldingShield(Player* this) {
-    if ((this->stateFlags1 & PLAYER_STATE1_SHIELDING) &&
+    // SOH [VR] Physical shield: held in the off hand whenever physically possible — no stance
+    // flag, no button. VrShield re-asserts this every tick while VrCombat_ShieldHeld.
+    if (((this->stateFlags1 & PLAYER_STATE1_SHIELDING) || VrCombat_ShieldHeld(this)) &&
         ((this->itemAction < 0) || (this->itemAction == this->heldItemAction))) {
         if ((CVarGetInteger(CVAR_CHEAT("ShieldTwoHanded"), 0) && (this->heldItemAction != PLAYER_IA_DEKU_STICK) ||
              !Player_HoldsTwoHandedWeapon(this)) &&
@@ -573,7 +575,16 @@ void Player_SetModelsForHoldingShield(Player* this) {
                 this->sheathDLists = &sPlayerDListGroups[this->sheathType][1];
             }
             this->modelAnimType = PLAYER_ANIMTYPE_2;
-            this->itemAction = -1;
+            // SOH [VR] Physical shield holds the shield perpetually WITHOUT the stance flag.
+            // itemAction = -1 is the vanilla "models diverged" marker, and Player_UpdateItems
+            // only processes item buttons while (itemAction == heldItemAction || SHIELDING) —
+            // in the stance, the flag's arm keeps buttons alive despite the -1; held
+            // physically full-time, the -1 would close that gate FOREVER (B could never draw
+            // the sword, C never use an item). VrShield re-syncs the models itself on its
+            // falling edge, so the marker stays stance-only.
+            if (this->stateFlags1 & PLAYER_STATE1_SHIELDING) {
+                this->itemAction = -1;
+            }
         }
     }
 }
@@ -1503,6 +1514,12 @@ s32 Player_OverrideLimbDrawGameplayFirstPerson(PlayState* play, s32 limbIndex, G
 // next limb once that hand's mesh + held item have drawn.
 static s32 sVrHandInvertCulling = false;
 
+// SOH [VR] 20 Hz hand-pose snapshot per VR hand, for extracting hand-LOCAL child transforms
+// (bow/slingshot string) that the interpreter re-composes against the LIVE controller pose —
+// welding derived geometry to the live-rendered hand instead of trailing it at game rate.
+static MtxF sVrHandLimbMtxF[2];
+static s32 sVrHandLimbFrame[2] = { -1, -1 };
+
 s32 Player_OverrideLimbDrawGameplayVRFirstPerson(PlayState* play, s32 limbIndex, Gfx** dList, Vec3f* pos, Vec3s* rot,
                                                  void* thisx) {
     Player* this = (Player*)thisx;
@@ -1569,6 +1586,10 @@ s32 Player_OverrideLimbDrawGameplayVRFirstPerson(PlayState* play, s32 limbIndex,
                 if (play->flexLimbOverrideMTX != NULL) {
                     VR_RegisterHandMatrix((const void*)*play->flexLimbOverrideMTX, vrHand);
                 }
+                // Snapshot the 20 Hz pose this frame's derived matrices (bowstring) are built
+                // against, so their hand-LOCAL part can be extracted for live re-composition.
+                sVrHandLimbMtxF[vrHand] = handMtx;
+                sVrHandLimbFrame[vrHand] = (s32)play->state.frames;
                 pos->x = pos->y = pos->z = 0.0f;
                 rot->x = rot->y = rot->z = 0;
                 if (mirror) {
@@ -1633,15 +1654,31 @@ void Player_UpdateShieldCollider(PlayState* play, Player* this, ColliderQuad* co
         COLTYPE_METAL,
     };
 
-    if (this->stateFlags1 & PLAYER_STATE1_SHIELDING) {
+    // SOH [VR] Physical shield: the quad registers whenever the shield is physically in hand —
+    // its vertices come from this limb's matrix, which VR pins to the off-hand controller, so
+    // where the player holds the shield IS where it blocks (geometric truth, no stance).
+    if ((this->stateFlags1 & PLAYER_STATE1_SHIELDING) || VrCombat_ShieldHeld(this)) {
         Vec3f quadDest[4];
 
         this->shieldQuad.base.colType = shieldColTypes[this->currentShield];
 
-        Matrix_MultVec3f(&quadSrc[0], &quadDest[0]);
-        Matrix_MultVec3f(&quadSrc[1], &quadDest[1]);
-        Matrix_MultVec3f(&quadSrc[2], &quadDest[2]);
-        Matrix_MultVec3f(&quadSrc[3], &quadDest[3]);
+        // SOH [VR] Physical shield: the collider is fully parametric (Shield sliders —
+        // dimensions, trapezoid shape, placement, tilt) instead of the vanilla stance quad,
+        // whose 60x60 offset square never matched a controller-held shield. Hits outside the
+        // configured quad don't count — they land on whatever was behind it.
+        if (VrCombat_ShieldHeld(this)) {
+            Vec3f vrSrc[4];
+            VrCombat_ShieldQuadModelVerts((f32*)vrSrc);
+            Matrix_MultVec3f(&vrSrc[0], &quadDest[0]);
+            Matrix_MultVec3f(&vrSrc[1], &quadDest[1]);
+            Matrix_MultVec3f(&vrSrc[2], &quadDest[2]);
+            Matrix_MultVec3f(&vrSrc[3], &quadDest[3]);
+        } else {
+            Matrix_MultVec3f(&quadSrc[0], &quadDest[0]);
+            Matrix_MultVec3f(&quadSrc[1], &quadDest[1]);
+            Matrix_MultVec3f(&quadSrc[2], &quadDest[2]);
+            Matrix_MultVec3f(&quadSrc[3], &quadDest[3]);
+        }
         Collider_SetQuadVertices(collider, &quadDest[0], &quadDest[1], &quadDest[2], &quadDest[3]);
 
         CollisionCheck_SetAC(play, &play->colChkCtx, &collider->base);
@@ -2057,7 +2094,26 @@ void Player_PostLimbDrawGameplay(PlayState* play, s32 limbIndex, Gfx** dList, Ve
                 Matrix_RotateZ(this->unk_858 * -0.2f, MTXMODE_APPLY);
             }
 
-            gSPMatrix(POLY_XLU_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            {
+                // SOH [VR] The bow renders at headset rate (live hand-matrix substitution) but
+                // this string matrix bakes the 20 Hz hand pose, so the string visibly trailed
+                // the live bow. Register it as a live CHILD of the hand: extract the
+                // hand-LOCAL part against the same 20 Hz snapshot, and the interpreter
+                // re-composes (live hand pose) x (local) every frame — string welded to bow.
+                Mtx* vrStringMtx = MATRIX_NEWMTX(play->state.gfxCtx);
+                s32 vrStringHand = (CVarGetInteger("gVrLeftHanded", 0) ? VR_HAND_LEFT : VR_HAND_RIGHT) ^ 1;
+                if (VR_IsInitialized() && VR_GetFirstPerson() &&
+                    (sVrHandLimbFrame[vrStringHand] == (s32)play->state.frames)) {
+                    MtxF vrCur;
+                    MtxF vrInv;
+                    MtxF vrLocal;
+                    Matrix_Get(&vrCur);
+                    SkinMatrix_Invert(&sVrHandLimbMtxF[vrStringHand], &vrInv);
+                    SkinMatrix_MtxFMtxFMult(&vrInv, &vrCur, &vrLocal);
+                    VR_RegisterHandChildMatrix((const void*)vrStringMtx, vrStringHand, &vrLocal.mf[0][0]);
+                }
+                gSPMatrix(POLY_XLU_DISP++, vrStringMtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            }
             gSPDisplayList(POLY_XLU_DISP++, stringData->dList);
 
             Matrix_Pop();

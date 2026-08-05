@@ -1416,6 +1416,13 @@ void Play_Draw(PlayState* play) {
                 if (vrPlayer->stateFlags2 & PLAYER_STATE2_CRAWLING) {
                     vrEyeHeight *= 0.5f;
                 }
+                // Riding: Link is SEATED and his root already sits at the saddle, so adding
+                // standing eye height floated the camera a meter above his head. Seated eye
+                // height above the seat is about half of standing (same ratio as the crawl
+                // correction).
+                if (vrPlayer->stateFlags1 & PLAYER_STATE1_ON_HORSE) {
+                    vrEyeHeight *= 0.5f;
+                }
                 vrHead.y += vrEyeHeight + CVarGetFloat("gVrHeadHeightOffset", -9.0f);
             }
             // Head position relative to Link's body, tunable from VR Settings. Forward/side follow

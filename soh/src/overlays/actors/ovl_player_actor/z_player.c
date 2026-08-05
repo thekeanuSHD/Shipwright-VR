@@ -2040,6 +2040,35 @@ void Player_AnimReplaceNormalPlayLoopAdjusted(PlayState* play, Player* this, Lin
     Player_AnimReplacePlayLoopAdjusted(play, this, anim, 0x1C);
 }
 
+// SOH [VR] Legaiaflame's Lock On (gVrLegaiaLockOn, off by default): while locked onto something,
+// hand Link's facing back to the vanilla lock-on rule instead of pinning it to the headset. His
+// body turns to the target and STAYS there, and the control stick is read in that frame, so
+// forward is toward the target and left/right circle around it — Z-targeting as the original game
+// plays it. The HEAD is deliberately untouched: the camera never snaps or locks, you look wherever
+// you like; only Link's body and "forward" belong to the target.
+//
+// True only when vanilla's own lock-on branch in Player_UpdateShapeYaw will actually aim the body
+// this frame (identical conditions), so dropping the VR pin can never leave facing to whatever the
+// last writer happened to leave behind.
+// Latched once per player update, at the point where this tick's rotation flags have settled. Both
+// readers then agree for the whole tick: Player_ProcessControlStick runs BEFORE the action func,
+// which is where PLAYER_STATE2_DISABLE_ROTATION_* gets set (it is cleared every tick just above),
+// so sampling the live predicate for steering and again for the facing pin would read it from
+// opposite sides of the same frame — steering could go target-relative on a tick where vanilla
+// never aimed the body at the target.
+static s32 sVrLockOnActive = 0;
+
+static s32 Player_VrLockOnBody(Player* this, PlayState* play) {
+    if (!CVarGetInteger("gVrLegaiaLockOn", 0) || !VR_IsInitialized() || !VR_GetFirstPerson()) {
+        return 0;
+    }
+    if (this->stateFlags2 & (PLAYER_STATE2_DISABLE_ROTATION_Z_TARGET | PLAYER_STATE2_DISABLE_ROTATION_ALWAYS)) {
+        return 0;
+    }
+    return (this->focusActor != NULL) &&
+           ((play->actorCtx.targetCtx.unk_4B != 0) || (this->actor.category != ACTORCAT_PLAYER));
+}
+
 // SOH [VR] Returns the yaw that control-stick input is interpreted relative to. In VR first-person
 // this is the HMD heading (so movement is head-relative); otherwise the active camera's yaw as normal.
 static s16 Player_GetSteeringYaw(PlayState* play) {
@@ -2048,7 +2077,15 @@ static s16 Player_GetSteeringYaw(PlayState* play) {
         // Crawlspaces: the stick must map to the TUNNEL axis (Link's body), not the head — you
         // can only crawl forward or backward, and looking around inside the tunnel must not
         // change which way "forward" is (it made the exit unreachable when the head was off-axis).
-        if (vrPlayer->stateFlags2 & PLAYER_STATE2_CRAWLING) {
+        // Grabbing a block/wall is the same rule: the stick maps to LINK'S body axis (forward =
+        // push, back = pull) no matter where the head looks — head-relative steering misread the
+        // stick against the block axis and let "pushing" wander wherever the player gazed.
+        if (vrPlayer->stateFlags2 & (PLAYER_STATE2_CRAWLING | PLAYER_STATE2_GRABBING_DYNAPOLY)) {
+            return vrPlayer->actor.shape.rot.y;
+        }
+        // Locked on: the stick is read in the BODY's frame, which vanilla keeps aimed at the
+        // target — forward closes on it, left/right circle it. Looking around no longer steers.
+        if (sVrLockOnActive) {
             return vrPlayer->actor.shape.rot.y;
         }
         return VR_GetHeadingYaw();
@@ -2971,6 +3008,14 @@ int func_80834E7C(PlayState* play) {
 }
 
 s32 func_80834EB8(Player* this, PlayState* play) {
+    // SOH [VR] Aiming never locks movement: projectiles (bow, slingshot, hookshot, boomerang)
+    // aim with the HAND in VR, so the standstill first-person aim stance is pointless — every
+    // aim takes the Z-target-style path instead (upper body aims, legs keep walking; the
+    // kinematic stick movement stays live because the main action remains locomotion).
+    // Shooting galleries keep their own stock aiming mode.
+    if (VR_IsInitialized() && VR_GetFirstPerson() && (play->shootingGalleryStatus == 0)) {
+        return 1;
+    }
     if ((this->unk_6AD == 0) || (this->unk_6AD == 2)) {
         if (Player_IsZTargeting(this) || (Camera_CheckValidMode(Play_GetCamera(play, 0), 7) == 0)) {
             return 1;
@@ -3094,7 +3139,17 @@ s32 func_808351D4(Player* this, PlayState* play) {
 
     func_80834EB8(this, play);
 
-    if ((this->unk_836 > 0) && ((this->unk_860 < 0) || (!sHeldItemButtonIsHeldDown && !func_80834E7C(play)))) {
+    // SOH [VR] CLASSIC mode gets two extra ways to loose once drawn: the aim hand's trigger
+    // (rising edge), and PRESSING the item's own button again (sUseHeldItem — the click IS the
+    // shot, like the old aim mode). Without the press path, clicking actually BLOCKED the
+    // vanilla release-to-fire by re-marking the button held every click.
+    // SELECTOR mode wants neither: there the trigger mirrors the item's button as held STATE, so
+    // the vanilla draw-and-release below IS the natural VR bow — squeeze to draw, let go to
+    // loose. A press-fire path on top would fire the instant you squeezed and there would be no
+    // holding an aim.
+    if ((this->unk_836 > 0) &&
+        ((!VrItemSelect_ModeActive() && (VrCombat_ProjectileFirePressed(this) || sUseHeldItem)) ||
+         (this->unk_860 < 0) || (!sHeldItemButtonIsHeldDown && !func_80834E7C(play)))) {
         Player_SetUpperActionFunc(this, func_808353D8);
         if (this->unk_860 >= 0) {
             if (sp2C == 0) {
@@ -3137,7 +3192,11 @@ s32 func_808353D8(Player* this, PlayState* play) {
             this->unk_834--;
         }
 
-        if (Player_IsZTargeting(this) || (this->unk_6AD != 0) || (this->stateFlags1 & PLAYER_STATE1_FIRST_PERSON)) {
+        // SOH [VR] Stay shouldered between shots in VR first person: the un-targeted vanilla
+        // path lowers the bow here, and the lower-animation window ate the next press — the
+        // "fires once then goes dead" bug.
+        if (Player_IsZTargeting(this) || (this->unk_6AD != 0) || (this->stateFlags1 & PLAYER_STATE1_FIRST_PERSON) ||
+            (VR_IsInitialized() && VR_GetFirstPerson())) {
             if (this->unk_834 == 0) {
                 this->unk_834++;
             }
@@ -4828,6 +4887,11 @@ s32 func_808382DC(Player* this, PlayState* play) {
         } else {
             sp64 = (this->shieldQuad.base.acFlags & AC_BOUNCED) != 0;
 
+            // SOH [VR] Physical shield: nonzero when this bounce is a physical block. Facing
+            // is already enforced inside CollisionCheck (bad-angle hits never bounce at all),
+            // so any bounce that reaches here is legitimate.
+            s32 vrShieldJudge = sp64 ? VrCombat_ShieldBlockJudge(this) : 0;
+
             //! @bug The second set of conditions here seems intended as a way for Link to "block" hits by rolling.
             // However, `Collider.atFlags` is a byte so the flag check at the end is incorrect and cannot work.
             // Additionally, `Collider.atHit` can never be set while already colliding as AC, so it's also bugged.
@@ -4836,6 +4900,16 @@ s32 func_808382DC(Player* this, PlayState* play) {
                          (this->cylinder.info.atHit != NULL) && (this->cylinder.info.atHit->atFlags & 0x20000000))) {
 
                 Player_RequestRumble(this, 180, 20, 100, 0);
+
+                // SOH [VR] Physical block: keep the damage negation and the Deku shield burn
+                // (haptic fired inside the judge), skip the stance reaction animation and the
+                // backwards shove — the player's real arm holds the line.
+                if (vrShieldJudge == 1) {
+                    if (this->shieldQuad.info.acHitInfo->toucher.effect == HIT_SPECIAL_EFFECT_FIRE) {
+                        func_8083819C(this, play);
+                    }
+                    return 0;
+                }
 
                 if (!Player_IsChildWithHylianShield(this)) {
                     if (this->invincibilityTimer >= 0) {
@@ -12062,7 +12136,9 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
                   (PLAYER_STATE1_TALKING | PLAYER_STATE1_HANGING_OFF_LEDGE | PLAYER_STATE1_CLIMBING_LEDGE |
                    PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_JUMPING |
                    PLAYER_STATE1_FREEFALL)) &&
-                !(this->stateFlags2 & PLAYER_STATE2_DIVING)) {
+                // Hands on a block: the body is anchored to it — physical walking becomes head
+                // lean ("head leans, body holds") instead of dragging Link off the grab.
+                !(this->stateFlags2 & (PLAYER_STATE2_DIVING | PLAYER_STATE2_GRABBING_DYNAPOLY))) {
                 float rsDesired[2];
                 VR_GetRoomscaleDesired(rsDesired);
                 float rsScale = CVarGetFloat("gVrRoomscaleScale", 1.0f);
@@ -12256,14 +12332,30 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
         // This is the last facing writer in the update loop; velocity is built from this->yaw, not
         // shape.rot.y, so pinning never redirects movement. Skipped in states where the game
         // choreographs Link's facing (cutscenes, horse, climbing, hanging).
-        if (Player_VrDirectMovement(this) && !Player_InBlockingCsMode(play, this) &&
+        // Grabbing a block/wall also keeps vanilla facing: the grab action locks Link's body to
+        // the block (PLAYER_STATE2_DISABLE_ROTATION_ALWAYS), and pinning the head heading over
+        // that lock let the push direction wander with the player's gaze.
+        // Legaiaflame's Lock On keeps vanilla facing for the same reason: while locked on, the
+        // body belongs to the TARGET (Player_UpdateShapeYaw just aimed it there), not to the head.
+        sVrLockOnActive = Player_VrLockOnBody(this, play);
+
+        if (Player_VrDirectMovement(this) && !Player_InBlockingCsMode(play, this) && !sVrLockOnActive &&
             !(this->stateFlags1 & (PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CLIMBING_LADDER |
                                    PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE)) &&
-            !(this->stateFlags2 & PLAYER_STATE2_CRAWLING)) {
+            !(this->stateFlags2 & (PLAYER_STATE2_CRAWLING | PLAYER_STATE2_GRABBING_DYNAPOLY))) {
             s16 vrPinnedYaw = VR_GetHeadingYaw();
             this->unk_87C = vrPinnedYaw - this->actor.shape.rot.y;
             this->actor.shape.rot.y = vrPinnedYaw;
         }
+
+        // SOH [VR] Legaiaflame's Lock On: hand the target's world direction to the VR layer, which
+        // rotates the playspace so the target stays in front of the player (a headset's orientation
+        // can't be driven, so the world turns instead). Pushed every tick — including the "not
+        // locked on" case, which clears it — and it expires on its own if this update ever stops
+        // running. Same direction vanilla aims Link's body at, so body and view agree.
+        VR_SetLockOnYaw(
+            sVrLockOnActive ? Math_Vec3f_Yaw(&this->actor.world.pos, &this->focusActor->focus.pos) : 0,
+            sVrLockOnActive);
 
         if (CHECK_FLAG_ALL(this->actor.flags, ACTOR_FLAG_TALK)) {
             this->talkActorDistance = 0.0f;

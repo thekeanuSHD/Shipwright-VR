@@ -36,6 +36,18 @@ bool InterfaceOk() {
 
 bool sWasActive = false;
 
+// Aim-hand trigger edge, sampled once per tick (VR first person, independent of physical
+// combat): while READY_TO_FIRE, this fires the bow/slingshot/hookshot — the natural VR
+// release, since the walk-while-aiming path only knows the vanilla item-button-release fire.
+bool sProjTriggerPressed = false;
+bool sProjTriggerPrev = false;
+
+int AimHand() {
+    // The hand that aims held projectiles (see Player_VrAimHeldProjectile): the bow rides
+    // Link's RIGHT hand model, driven by the player's LEFT controller when right-handed.
+    return CVarGetInteger("gVrLeftHanded", 0) ? VR_HAND_RIGHT : VR_HAND_LEFT;
+}
+
 // Once per 20 Hz game tick, right after the player actor updates (and after the tick's
 // CollisionCheck pass at the top of Play_Update, but before Play_Draw builds the display list):
 //  1. read back last tick's melee quad results (hit haptics, one-hit-per-swing),
@@ -52,11 +64,22 @@ void OnPlayerUpdateVrCombat() {
         return;
     }
 
+    // Trigger edge for projectile fire — sampled regardless of the physical-combat toggle
+    // (walk-while-aiming is plain VR, so its fire input must be too).
+    {
+        const bool cur =
+            VR_IsInitialized() && VR_GetFirstPerson() && (VR_GetControllerButton(AimHand()) & VR_BTN_TRIGGER);
+        sProjTriggerPressed = cur && !sProjTriggerPrev;
+        sProjTriggerPrev = cur;
+    }
+
     const bool active = VrCombat_Active();
     if (active) {
         VrCombat::Swing_OnPlayerUpdate(gPlayState, player);
+        VrCombat::Shield_OnPlayerUpdate(gPlayState, player);
     } else if (sWasActive) {
         VrCombat::Swing_Deactivate(gPlayState, player);
+        VrCombat::Shield_Deactivate(gPlayState, player);
     }
     sWasActive = active;
 
@@ -66,6 +89,24 @@ void OnPlayerUpdateVrCombat() {
 }
 
 } // namespace
+
+extern "C" bool VrCombat_ProjectileFirePressed(Player* player) {
+    (void)player;
+    return sProjTriggerPressed;
+}
+
+extern "C" bool VrCombat_AimTriggerConsumed(int32_t vrHand, uint16_t vrBtnMask) {
+    // While READY_TO_FIRE in VR first person, the aim hand's trigger IS the fire control:
+    // padmgr must not also emit its normal button binding (Z-target flicker on every shot).
+    if (!(vrBtnMask & VR_BTN_TRIGGER) || vrHand != AimHand()) {
+        return false;
+    }
+    if (!VR_IsInitialized() || !VR_GetFirstPerson() || gPlayState == NULL) {
+        return false;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    return player != NULL && (player->stateFlags1 & PLAYER_STATE1_READY_TO_FIRE);
+}
 
 extern "C" bool VrCombat_Active(void) {
     if (!CVarGetInteger("gVrPhysCombat", 0) || !InterfaceOk()) {

@@ -159,8 +159,8 @@ extern "C" void VrCombat_DrawDebugOverlay(void) {
         // the tracker gates on blade TIP speed, which runs higher than the hand on arm swings,
         // so treat the colors as a floor, not the exact gate).
         if (haveVel) {
-            const float kPreviewArmSpeed = CVarGetFloat("gVrPhysArmSpeed", 1.2f);
-            const float kPreviewHitSpeed = CVarGetFloat("gVrPhysHitSpeed", 2.2f);
+            const float kPreviewArmSpeed = CVarGetFloat("gVrPhysArmSpeed", 2.0f);
+            const float kPreviewHitSpeed = CVarGetFloat("gVrPhysHitSpeed", 5.0f);
             const float speed = sqrtf(lin[0] * lin[0] + lin[1] * lin[1] + lin[2] * lin[2]);
             if (speed >= kPreviewHitSpeed) {
                 sDl.push_back(gsDPSetPrimColor(0, 0, 255, 60, 60, 255));
@@ -287,6 +287,18 @@ extern "C" void VrCombat_DrawDebugOverlay(void) {
             const float* q = &quadVerts[i * 12];
             // ColliderQuad vertex order: draw as 0,2,3,1 (the colViewer convention).
             PushQuad({ q[0], q[1], q[2] }, { q[6], q[7], q[8] }, { q[9], q[10], q[11] }, { q[3], q[4], q[5] });
+        }
+    }
+
+    // The shield's BLOCK collider (cyan): the exact quad enemy attacks are judged against —
+    // deliberately INSET from the visible shield by the Shield Collider Scale slider, so the
+    // gap between the steel you see and the cyan you see is exactly the rim that doesn't count.
+    {
+        Player* player = GET_PLAYER(gPlayState);
+        if (player != NULL && VrCombat_ShieldHeld(player)) {
+            const Vec3f* v = player->shieldQuad.dim.quad;
+            sDl.push_back(gsDPSetPrimColor(0, 0, 60, 220, 255, 255));
+            PushQuad(v[0], v[2], v[3], v[1]);
         }
     }
 

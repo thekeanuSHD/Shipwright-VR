@@ -7,6 +7,7 @@
 #include "soh/OTRGlobals.h"
 #include "soh/ResourceManagerHelpers.h"
 #include "soh/Enhancements/savestate_serialize.h"
+#include <vr_interface.h>
 
 typedef enum {
     /* 0 */ LENS_FLARE_CIRCLE0,
@@ -1300,12 +1301,72 @@ void Environment_Update(PlayState* play, EnvironmentContext* envCtx, LightContex
     }
 }
 
+// SOH [VR] World-space billboard for the celestial quads. In VR first person the segment-1
+// billboard matrix is built from the HEAD pose, so the sun and moon visibly rotated with the
+// player's head (the crescent moon especially). Instead: face the eye along the quad's own sky
+// direction with world-vertical up — head rotation can't touch it, and the 20 Hz build rate is
+// invisible because nothing here tracks the head. Basis convention matches the vanilla view
+// (right = up x back), so the textures aren't mirrored relative to stock.
+static void Environment_VrCelestialBillboard(f32 toEyeX, f32 toEyeY, f32 toEyeZ, MtxF* out) {
+    f32 len = sqrtf(SQ(toEyeX) + SQ(toEyeY) + SQ(toEyeZ));
+    f32 fx, fy, fz;
+    f32 rx, ry, rz;
+    f32 rLen;
+    f32 upRefY = 1.0f;
+    f32 upRefZ = 0.0f;
+
+    if (len < 0.001f) {
+        len = 1.0f;
+    }
+    fx = toEyeX / len;
+    fy = toEyeY / len;
+    fz = toEyeZ / len;
+    // right = worldUp x fwd, falling back to world Z as the reference near the zenith.
+    if (fabsf(fy) > 0.99f) {
+        upRefY = 0.0f;
+        upRefZ = 1.0f;
+    }
+    rx = upRefY * fz - upRefZ * fy;
+    ry = upRefZ * fx;
+    rz = -upRefY * fx;
+    rLen = sqrtf(SQ(rx) + SQ(ry) + SQ(rz));
+    if (rLen < 0.001f) {
+        rLen = 1.0f;
+    }
+    rx /= rLen;
+    ry /= rLen;
+    rz /= rLen;
+
+    out->xx = rx;
+    out->yx = ry;
+    out->zx = rz;
+    out->wx = 0.0f;
+    // up = fwd x right (right-handed: right x up = fwd).
+    out->xy = fy * rz - fz * ry;
+    out->yy = fz * rx - fx * rz;
+    out->zy = fx * ry - fy * rx;
+    out->wy = 0.0f;
+    out->xz = fx;
+    out->yz = fy;
+    out->zz = fz;
+    out->wz = 0.0f;
+    out->xw = 0.0f;
+    out->yw = 0.0f;
+    out->zw = 0.0f;
+    out->ww = 1.0f;
+}
+
 void Environment_DrawSunAndMoon(PlayState* play) {
     f32 alpha;
     f32 color;
     f32 y;
     f32 scale;
     f32 temp;
+    // SOH [VR] see Environment_VrCelestialBillboard. Applies in EVERY VR mode, not just first
+    // person: third person and cutscenes render with the player's head-look composed onto the
+    // game camera, so the view-derived segment-1 billboard carries head orientation there too
+    // (the intro cutscene moon pivoted with the player's head).
+    s32 vrCelestial = VR_IsInitialized();
 
     OPEN_DISPS(play->state.gfxCtx);
 
@@ -1354,6 +1415,14 @@ void Environment_DrawSunAndMoon(PlayState* play) {
 
         scale = (color * 2.0f) + 10.0f;
         Matrix_Scale(scale, scale, scale, MTXMODE_APPLY);
+        // SOH [VR] World-space billboard baked into the modelview (replaces the head-tracking
+        // segment-1 multiply below). The sun sits at eye + sunPos, so it faces along -sunPos.
+        if (vrCelestial) {
+            MtxF vrBb;
+            Environment_VrCelestialBillboard(-play->envCtx.sunPos.x, -play->envCtx.sunPos.y, -play->envCtx.sunPos.z,
+                                             &vrBb);
+            Matrix_Mult(&vrBb, MTXMODE_APPLY);
+        }
         gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_LOAD);
         Gfx_SetupDL_54Opa(play->state.gfxCtx);
 
@@ -1365,7 +1434,11 @@ void Environment_DrawSunAndMoon(PlayState* play) {
         };
 
         // Replacement for gSunDL
-        gSPMatrix(POLY_OPA_DISP++, SEG_ADDR(1, 0), G_MTX_NOPUSH | G_MTX_MUL | G_MTX_MODELVIEW);
+        // SOH [VR] segment 1 is the head-derived billboard: skipped in VR first person (the
+        // world-space billboard is already in the modelview above).
+        if (!vrCelestial) {
+            gSPMatrix(POLY_OPA_DISP++, SEG_ADDR(1, 0), G_MTX_NOPUSH | G_MTX_MUL | G_MTX_MODELVIEW);
+        }
         gDPPipeSync(POLY_OPA_DISP++);
         gDPLoadTextureBlock_4b(POLY_OPA_DISP++, gSun1Tex, G_IM_FMT_I, 64, 64, 0, G_TX_NOMIRROR | G_TX_CLAMP,
                                G_TX_NOMIRROR | G_TX_CLAMP, 6, 6, G_TX_NOLOD, G_TX_NOLOD);
@@ -1383,6 +1456,17 @@ void Environment_DrawSunAndMoon(PlayState* play) {
         scale = -15.0f * color + 25.0f;
         scale *= CVarGetFloat(CVAR_COSMETIC("Moon.Size"), 1.0f);
         Matrix_Scale(scale, scale, scale, MTXMODE_APPLY);
+        // SOH [VR] World-space billboard for the moon (it sits at eye - sunPos, so it faces
+        // along +sunPos). gMoonDL's own segment-1 multiply is neutralized at draw time below —
+        // composing its inverse here instead broke under frame interpolation: the modelview is
+        // interpolated between ticks, the DL's segment matrix is not, and the mismatch made
+        // the moon tumble with head motion.
+        if (vrCelestial) {
+            MtxF vrBb;
+            Environment_VrCelestialBillboard(play->envCtx.sunPos.x, play->envCtx.sunPos.y, play->envCtx.sunPos.z,
+                                             &vrBb);
+            Matrix_Mult(&vrBb, MTXMODE_APPLY);
+        }
 
         temp = -y / 80.0f;
         temp = CLAMP_MAX(temp, 1.0f);
@@ -1401,7 +1485,17 @@ void Environment_DrawSunAndMoon(PlayState* play) {
                 gDPSetPrimColor(POLY_OPA_DISP++, 0, 0, 240, 255, 180, alpha);
                 gDPSetEnvColor(POLY_OPA_DISP++, 80, 70, 20, alpha);
             }
+            // SOH [VR] gMoonDL multiplies the head-derived segment-1 billboard INSIDE the
+            // display list. Point segment 1 at IDENTITY for exactly this draw — the multiply
+            // becomes a no-op, the world-space billboard in the modelview stands alone — then
+            // restore the real billboard matrix for everything drawn after.
+            if (vrCelestial) {
+                gSPSegment(POLY_OPA_DISP++, 0x01, &gMtxClear);
+            }
             gSPDisplayList(POLY_OPA_DISP++, gMoonDL);
+            if (vrCelestial) {
+                gSPSegment(POLY_OPA_DISP++, 0x01, play->billboardMtx);
+            }
         }
     }
 

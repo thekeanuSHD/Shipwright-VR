@@ -2,6 +2,7 @@
 #include "vt.h"
 #include "overlays/effects/ovl_Effect_Ss_HitMark/z_eff_ss_hitmark.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
+#include "soh/Enhancements/vr-combat/VrCombat.h"
 #include <assert.h>
 
 typedef s32 (*ColChkResetFunc)(PlayState*, Collider*);
@@ -1723,6 +1724,14 @@ void CollisionCheck_SetBounce(Collider* at, Collider* ac) {
  */
 s32 CollisionCheck_SetATvsAC(PlayState* play, Collider* at, ColliderInfo* atInfo, Vec3f* atPos, Collider* ac,
                              ColliderInfo* acInfo, Vec3f* acPos, Vec3f* hitPos) {
+    // SOH [VR] Physical shield facing gate: an attack touching the shield quad from outside
+    // its facing cone is ignored ENTIRELY at the source — no bounce, no enemy recoil, no
+    // flags. The attack keeps flying as if the shield weren't there and may go on to hit the
+    // body. (Judging later, in the player's damage handler, was too late: the AC_HARD bounce
+    // here is what actually cancels an enemy's attack, from any angle.)
+    if (VrCombat_ShieldFacingVeto(ac, at)) {
+        return 0;
+    }
     if (ac->acFlags & AC_HARD && at->actor != NULL && ac->actor != NULL) {
         CollisionCheck_SetBounce(at, ac);
     }

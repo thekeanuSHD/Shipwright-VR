@@ -66,6 +66,53 @@ void VrCombat_MeshFleshPop(struct GraphicsContext* gfxCtx);
 void VrCombat_FlinchWarpBegin(struct PlayState* play, void* actorArg, int32_t limbIndex);
 void VrCombat_FlinchWarpEnd(void);
 
+// M4 physical shield. ShieldHeld: the shield is physically in the off hand — this widens the
+// vanilla PLAYER_STATE1_SHIELDING gates on the shield hand model and the shield quad, so the
+// quad registers from the off-hand controller pose every frame with no stance, no button.
+// ShieldFacingVeto: the facing gate, called from CollisionCheck_SetATvsAC for every confirmed
+// AT-vs-AC hit (one pointer compare for everything that isn't the physical shield quad). True
+// when the attack comes from outside the shield's facing cone (gVrPhysShieldFacingDeg): the
+// hit is then dropped at the source — no bounce, no enemy recoil, the attack passes the
+// shield as if it weren't there. ShieldBlockJudge: called from func_808382DC when the quad
+// DID bounce an attack — 0 = not physical (vanilla handling), 1 = physical block (haptic
+// fired; caller keeps damage negation + Deku burn, skips the stance reaction anim and shove).
+bool VrCombat_ShieldHeld(struct Player* player);
+bool VrCombat_ShieldFacingVeto(void* acCollider, void* atCollider);
+int32_t VrCombat_ShieldBlockJudge(struct Player* player);
+
+// Alyx-style item selector (VrItemSelect.cpp — VR first person, independent of physical
+// combat): hold the configured VR input, flick the hand toward an item, release to take it.
+// True when the given VR input on the given hand is DEDICATED to the selector — padmgr skips
+// that input's normal button binding so the opening click never leaks its bound action.
+bool VrItemSelect_ConsumesInput(int32_t vrHand, uint16_t vrBtnMask);
+
+// SELECTOR MODE (gVrItemSelect on, VR first person): the selector equips and the TRIGGER of the
+// hand the item ended up in uses it, replacing "press the C button you assigned it to".
+// ModeActive: the mode owns item activation this frame (third person and flat screen stay stock).
+// TriggerItemMask: the N64 button the item held in this hand answers to, or 0 — padmgr ORs it into
+// the pad while that hand's trigger is DOWN, as button state rather than a one-frame press, so
+// press/hold/release all come out of the vanilla item path (that is what makes draw-and-hold and
+// release-to-fire work with nothing re-implemented). Returns 0 for weapons physical combat covers,
+// where the swing is the attack. TriggerConsumed: both triggers are reserved in selector mode, so
+// padmgr skips their normal bindings — the selector-mode binding profile rehouses Z-target and
+// friends on the grips and face buttons.
+bool VrItemSelect_ModeActive(void);
+uint16_t VrItemSelect_TriggerItemMask(int32_t vrHand);
+bool VrItemSelect_TriggerConsumed(int32_t vrHand, uint16_t vrBtnMask);
+
+// Projectile fire (VR first person, independent of physical combat): the walk-while-aiming
+// path only fires on the vanilla item-button RELEASE, so the aim hand's trigger is wired in
+// as the natural VR fire. FirePressed: rising edge of that trigger this tick (checked in the
+// bow/slingshot/hookshot aim action). AimTriggerConsumed: true while READY_TO_FIRE for the
+// aim hand's trigger — padmgr skips its normal binding so a shot can't also toggle Z-target.
+bool VrCombat_ProjectileFirePressed(struct Player* player);
+bool VrCombat_AimTriggerConsumed(int32_t vrHand, uint16_t vrBtnMask);
+// The physical shield's block collider, built parametrically from the Shield sliders in
+// R_HAND limb model space (outXyz4 = 4 vertices x xyz, vanilla zigzag order) — replaces the
+// vanilla stance quad, whose size/offset never matched a controller-held shield. Strictness =
+// dimensions smaller than the visible shield: rim grazes miss the collider entirely.
+void VrCombat_ShieldQuadModelVerts(float* outXyz4);
+
 #ifdef __cplusplus
 }
 
@@ -95,6 +142,11 @@ const TickPath& GetTickPath(int hand);
 void Swing_OnPlayerUpdate(PlayState* play, Player* player);
 // Falling edge of VrCombat_Active(): hand melee state back to vanilla (state 0, trail off).
 void Swing_Deactivate(PlayState* play, Player* player);
+
+// Per-tick shield bookkeeping (VrShield.cpp): keeps the shield model in the off hand while
+// physically held, restores the vanilla models on the falling edge.
+void Shield_OnPlayerUpdate(PlayState* play, Player* player);
+void Shield_Deactivate(PlayState* play, Player* player);
 
 // Debug-overlay snapshots (this tick): the blade's contact-primitive set, and this draw's
 // registered damage quads as 12 floats each (4 verts x xyz). Plain float arrays so this header

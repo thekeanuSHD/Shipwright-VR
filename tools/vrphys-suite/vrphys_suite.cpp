@@ -581,6 +581,68 @@ static Result RunCapsuleCase(int mode) {
     return r;
 }
 
+// Cosmetic weight lag ("Ancient Dungeon wiggle"): during a constant 6 rad/s swing the SERVED
+// (rendered) pose must trail the SIM pose by ~ang_vel * lag (8.6 deg at 25 ms), rebound past
+// zero when the swing stops (the wiggle), and settle to exactly zero at rest. The sim pose —
+// what contacts and damage use — never lags, which is the whole point.
+static void RunWeightLagCase() {
+    vrphys_reset();
+    const float turn[4] = { 0, 0, 0, 1 };
+    const float turnOff[3] = { 0, 0, 0 };
+    const float anchor[3] = { 0, 0, 0 };
+    vrphys_set_contact_prims(nullptr, 0);
+    VrPhysObjectDesc desc = MeshCaseDesc();
+    desc.visual_lag_s = 0.025f;
+    desc.visual_snap_hz = 5.0f;
+    vrphys_set_object(VRPHYS_SLOT_WEAPON, &desc);
+
+    const float dt = 1.0f / 90.0f;
+    uint64_t t = 0;
+    float theta = 0.0f;
+    double steadySum = 0;
+    int steadyN = 0;
+    float reboundPeak = 0.0f;
+    bool crossed = false;
+    float residual = 0.0f;
+    for (int step = 0; step < 300; step++) {
+        const bool swinging = step < 150;
+        if (swinging) {
+            theta += 6.0f * dt;
+        }
+        const float quat[4] = { 0, sinf(theta * 0.5f), 0, cosf(theta * 0.5f) };
+        const float pos[3] = { 0, 0, 0 };
+        const float lin[3] = { 0, 0, 0 };
+        const float ang[3] = { 0, swinging ? 6.0f : 0.0f, 0 };
+        t += (uint64_t)(dt * 1e9f);
+        vrphys_push_hand_sample(1, pos, quat, lin, ang, true, t);
+        vrphys_step(dt, turn, turnOff, anchor, kScale, true);
+
+        float opos[3], oq[4], ov[3], oa[3];
+        vrphys_get_object_pose(VRPHYS_SLOT_WEAPON, opos, oq, ov, oa); // sim pose (identity turn)
+        float sp[3], sq[4];
+        vrphys_get_hand_sim_pose_raw(1, sp, sq); // served pose (wiggle applied)
+        float dq = fabsf(oq[0] * sq[0] + oq[1] * sq[1] + oq[2] * sq[2] + oq[3] * sq[3]);
+        const float wig = 2.0f * acosf(dq > 1.0f ? 1.0f : dq) * 180.0f / 3.14159265f;
+        if (step >= 100 && step < 150) {
+            steadySum += wig;
+            steadyN++;
+        }
+        if (step >= 150) {
+            if (!crossed && wig < 1.0f) {
+                crossed = true;
+            } else if (crossed && wig > reboundPeak) {
+                reboundPeak = wig;
+            }
+        }
+        if (step == 299) {
+            residual = wig;
+        }
+    }
+    printf("  WEIGHT wiggle (25 ms lag)    | steady lag %5.2f deg (expect ~8.6) | rebound %4.2f "
+           "deg | residual %6.4f deg (expect ~0)\n",
+           (float)(steadySum / (steadyN ? steadyN : 1)), reboundPeak, residual);
+}
+
 int main() {
     struct Case {
         const char* name;
@@ -656,6 +718,7 @@ int main() {
         printf("  THIN bone between samples    | HF %7.3f mm | contacts %d-%d | zero-contact %d "
                "(expect 0)\n",
                thin.heldJitterMm, thin.minContacts, thin.maxContacts, thin.zeroContactSteps);
+        RunWeightLagCase();
     }
 
     printf("\n=== FRICTION A/B (tip pressed on flat wall, hand drags sideways at 0.36 m/s) ===\n");

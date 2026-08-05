@@ -403,9 +403,9 @@ float BladeLengthModelUnits(Player* player) {
     }
     switch (held) {
         case 1:
-            return CVarGetFloat("gVrPhysBladeLenMaster", 40.0f) * 100.0f;
+            return CVarGetFloat("gVrPhysBladeLenMaster", 35.0f) * 100.0f;
         case 2:
-            return CVarGetFloat("gVrPhysBladeLenKokiri", 30.0f) * 100.0f;
+            return CVarGetFloat("gVrPhysBladeLenKokiri", 18.0f) * 100.0f;
         case 3:
             return CVarGetFloat("gVrPhysBladeLenBiggoron", 55.0f) * 100.0f;
         default:
@@ -778,7 +778,7 @@ void PushContactPrims(PlayState* play, Player* player, const Vec3f& base, const 
             Vec3f away = { away3.x, 0.0f, away3.z };
             const float d = sqrtf(away.x * away.x + away.z * away.z);
             if (d > 1e-3f) {
-                const float push = CVarGetFloat("gVrPhysPressPush", 2.5f);
+                const float push = CVarGetFloat("gVrPhysPressPush", 0.0f);
                 // Queued: written here (draw time) it would be zeroed before consumption.
                 QueueImpulse(col->actor, (away.x / d) * push, (away.z / d) * push);
                 if (pressedCount < 8) {
@@ -1116,13 +1116,13 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
     }
 
     // ---- 2. Tier hysteresis ----
-    const float armSpeed = CVarGetFloat("gVrPhysArmSpeed", 1.2f);
-    const float hitSpeed = CVarGetFloat("gVrPhysHitSpeed", 2.2f);
-    const float heavySpeed = CVarGetFloat("gVrPhysHeavySpeed", 4.0f);
+    const float armSpeed = CVarGetFloat("gVrPhysArmSpeed", 2.0f);
+    const float hitSpeed = CVarGetFloat("gVrPhysHitSpeed", 5.0f);
+    const float heavySpeed = CVarGetFloat("gVrPhysHeavySpeed", 8.0f);
     const float reArmSpeed = CVarGetFloat("gVrPhysReArmSpeed", 0.8f);
     // Damage additionally requires the HAND itself to move: a stationary-wrist flick can spin
     // the blade fast but never hurts anything (it still arms — trail/SFX/AI windup feedback).
-    const float minHandSpeed = CVarGetFloat("gVrPhysMinHandSpeed", 0.6f);
+    const float minHandSpeed = CVarGetFloat("gVrPhysMinHandSpeed", 1.2f);
     const bool handCommitted = sTickHandSpeed >= minHandSpeed;
 
     if (sTier == TIER_IDLE) {
@@ -1190,7 +1190,7 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
             const Vec3f flatDir = vnorm(vcross(fwdDir, widthDir));
             const Vec3f colShift =
                 vadd(vadd(vscale(fwdDir, CVarGetFloat("gVrPhysBladeShiftFwd", 0.0f)),
-                          vscale(widthDir, CVarGetFloat("gVrPhysBladeShiftEdge", 0.0f))),
+                          vscale(widthDir, CVarGetFloat("gVrPhysBladeShiftEdge", 1.1f))),
                      vscale(flatDir, CVarGetFloat("gVrPhysBladeShiftFlat", 0.0f)));
             const Vec3f baseAdj = vadd(baseLocal0, colShift);
             const Vec3f tipAdj = vadd(tipLocal0, colShift);
@@ -1217,7 +1217,7 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
         }
         desc.contactEnabled = 1;
         // Low default friction: steel skates along stone/flesh instead of planting.
-        desc.friction = CVarGetFloat("gVrPhysBladeFriction", 0.3f);
+        desc.friction = CVarGetFloat("gVrPhysBladeFriction", 0.5f);
         // Contact distances are authored in GAME UNITS (what the blade-length sliders use) and
         // converted to meters here, so they mean the same thing at any world scale.
         desc.bladeRadiusM = CVarGetFloat("gVrPhysBladeThickness", 0.4f) / worldScale;
@@ -1227,10 +1227,15 @@ extern "C" void VrCombat_FeedMelee(PlayState* play, Player* player) {
         // Committed swings cut THROUGH instead of snagging; default matches the damage tier
         // ("fast enough to hurt = fast enough to cut through").
         desc.passthroughSpeedMps = CVarGetFloat("gVrPhysPassthroughSpeed", 2.2f);
-        desc.cutDragFlesh = CVarGetFloat("gVrPhysCutDragFlesh", 0.55f);
-        desc.cutDragWorld = CVarGetFloat("gVrPhysCutDragWorld", 0.2f);
+        desc.cutDragFlesh = CVarGetFloat("gVrPhysCutDragFlesh", 0.97f);
+        desc.cutDragWorld = CVarGetFloat("gVrPhysCutDragWorld", 0.73f);
         desc.angFreqHz = CVarGetFloat("gVrPhysSwordAngFreq", 30.0f);
         desc.maxAccelMps2 = CVarGetFloat("gVrPhysMaxAccel", 400.0f);
+        // Ancient Dungeon-style cosmetic weight: the RENDERED sword trails fast swings by a
+        // few frames of rotation and snaps back with a little overshoot. Collision, damage
+        // and swing detection never lag — this is pure feel.
+        desc.visualLagS = CVarGetFloat("gVrPhysWeightLagMs", 0.0f) * 0.001f;
+        desc.visualSnapHz = CVarGetFloat("gVrPhysWeightSnapHz", 2.0f);
         VR_PhysSetObject(VR_PHYS_SLOT_WEAPON, &desc);
         PushContactPrims(play, player, base0, tip0);
         // Solve the blade against every tracked puppet's limbs (recorded during last draw):
@@ -1445,7 +1450,7 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
         if (sTier == TIER_HOT && sPendingStrikeCount < 4) {
             const s32 held = Player_GetMeleeWeaponHeld(player);
             const int row = Player_HoldsBrokenKnife(player) ? 1 : (int)held - 1;
-            const float heavySpeed = CVarGetFloat("gVrPhysHeavySpeed", 4.0f);
+            const float heavySpeed = CVarGetFloat("gVrPhysHeavySpeed", 8.0f);
             PendingStrike& st = sPendingStrikes[sPendingStrikeCount++];
             st.pos = pos;
             st.normal = { events[i].normal[0], events[i].normal[1], events[i].normal[2] };
@@ -1479,7 +1484,7 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
                 // pass before the victim consumes it — it lands from the player UPDATE instead.
                 // NPCs are exempt: their limbs react but they stay planted.
                 if (victim->category != ACTORCAT_NPC && victim->colChkInfo.mass != MASS_IMMOVABLE) {
-                    float mag = sTickTipSpeed * CVarGetFloat("gVrPhysKnockbackScale", 1.0f) * 1.5f;
+                    float mag = sTickTipSpeed * CVarGetFloat("gVrPhysKnockbackScale", 0.0f) * 1.5f;
                     const float cap = CVarGetFloat("gVrPhysKnockbackCap", 8.0f);
                     if (mag > cap) {
                         mag = cap;
@@ -1508,7 +1513,7 @@ void Swing_OnPlayerUpdate(PlayState* play, Player* player) {
                 const Vec3f hitPos = ClosestOnSegToSeg(bladeBase, bladeTip, axisA, axisB);
                 const Vec3f flinchDir = { dir.x, 0.15f, dir.z }; // a touch of lift reads as impact
                 const float speedNorm = sTickTipSpeed / 6.0f;
-                const float strength = CVarGetFloat("gVrPhysFlinchAmount", 18.0f) *
+                const float strength = CVarGetFloat("gVrPhysFlinchAmount", 0.0f) *
                                        (0.5f + (speedNorm > 1.0f ? 1.0f : speedNorm) * 0.5f);
                 PuppetHitKick(victim, hitPos, flinchDir, strength);
             }

@@ -26,17 +26,31 @@ animation-driven enemies), GORN/Blade & Sorcery (limb manipulation).
   flesh materials, pacifist test mode. Remaining: AT_BOUNCED armor clank, Lizalfos/Stalfos
   AI regression pass, user's collider-shift defaults, pacifist tooltip fix (says "damage still
   lands" — it doesn't: frozen enemies register no hurtboxes).
-- **M4 Physical shield, M5 pots, M6 bow, M7 two-hand heavies, M8 polish** — not started.
+- **M4 Physical shield** — IN PROGRESS, core implemented (uncommitted): the shield rides the
+  off hand with no button/stance (`VrShield.cpp` + three widened vanilla gates), blocking is
+  purely geometric via the vanilla shield quad's AC_HARD bounce, block haptic, no stagger/
+  shove, Deku burn kept. Remaining: headset pass (plan tests: Deku Baba lunge mid-stride,
+  Octorok rock deflect, Deku shield burns, attacks from behind hit), shield-vs-blade/world
+  physicality (SHIELD sim slot) if wanted, `gVrPhysShieldPushback` knob if wanted.
+- **M5 pots, M6 bow, M7 two-hand heavies, M8 polish** — not started.
 
 ## Architecture (three layers)
 
 ### Layer 0 — libultraship sim (`libultraship/src/fast/vr_physics.cpp`, headset rate)
 
 Self-contained held-object simulation in RAW tracking space (meters), stepped per XR frame
-from `vr_begin_frame`. C ABI in `include/vr_interface.h`, **interface version 13** (asserted
+from `vr_begin_frame`. C ABI in `include/vr_interface.h`, **interface version 14** (asserted
 game-side at init; bump on any struct change). Contact-prim channel holds 48; capsule/sphere
 prims get a continuous closest-pair contact in the solver (point samples alone let a thin
 bone capsule slip between them).
+
+- **Cosmetic weight lag ("Ancient Dungeon wiggle", `visualLagS`/`visualSnapHz`)**: the SERVED
+  (rendered) pose — `vrphys_get_hand_sim_pose_raw`, the single point every game-facing hand
+  consumer flows through — trails the hand's rotation by ~25 ms during fast swings and snaps
+  back through a slightly underdamped spring (zeta 0.55; the overshoot IS the wiggle).
+  Physics never sees it: contacts, the blade ring and damage all read `sl.quat`. The
+  grip-local blade extraction game-side is self-consistent because the drawn matrix and
+  VR_GetHandPose carry the same wiggled pose, so the offset cancels out of the geometry.
 
 - **Position-based solver, not impulses**: a spring-damper (implicit/backward-Euler,
   unconditionally stable) drives a collision-free TARGET pose; the blade walks toward it in
@@ -99,6 +113,14 @@ bone capsule slip between them).
   zeroed by the damage pass before consumption; vanilla `colChkInfo.mass` is IGNORED — it
   means "can't be walk-pushed", a Stalchild is MASS_HEAVY), **limb puppet system** (below),
   pacifist mode, per-sword blade length, debug accessors.
+- `VrShield.cpp` — M4 physical shield: `VrCombat_ShieldHeld()` widens the two
+  `PLAYER_STATE1_SHIELDING` gates (`Player_SetModelsForHoldingShield`,
+  `Player_UpdateShieldCollider`) so the shield model + quad live on the off-hand controller
+  pose full-time; `VrCombat_ShieldBlockPhysical()` in `func_808382DC`'s bounce branch skips
+  the stance reaction anim + `linearVelocity = -18` shove (damage negation + Deku burn stay
+  vanilla) and fires the block haptic (150 ms re-arm). The stance flag itself is never set —
+  it's force-cleared every frame by vanilla and nothing here needs it. Suspends for
+  bow/hookshot/bottles (off hand busy), child-with-Hylian (back carry), two-handers.
 - `VrCombatDebug.cpp` — overlay: contact prims, harvested-mesh magenta wireframe, cyan blade
   rectangle, puppet limb dots (white = tracked, red+bigger = being displaced), velocity
   arrows, damage quads. The overlay masks itself from the harvest (it once collided with its
@@ -137,17 +159,30 @@ diagnostics (debug overlay, physics log, pacifist mode, haptic tests, live reado
 
 ## CVars quick reference (defaults)
 
-`gVrPhysCombat` 0 · `gVrPhysCombatDebug` 0 · `gVrPhysVisualMesh` 1 · `gVrPhysPacifist` 0
-Speeds: Arm 1.2 / Hit 2.2 / Heavy 4.0 / ReArm 0.8 / MinHand 0.6 (m/s)
-Blade: LenKokiri 30 / LenMaster 40 / LenBiggoron 55 / Width 4 / Thickness 0.4 / Roll −90 /
-ShiftFwd 0 / ShiftEdge 0 / ShiftFlat 0 / TipTaper 0.2
+`gVrPhysCombat` 0 · `gVrPhysCombatDebug` 0 · `gVrPhysVisualMesh` 1 · `gVrPhysPacifist` 0 ·
+`gVrPhysShield` 1 · Shield collider (fully parametric, replaces the vanilla stance quad; cyan
+quad in the debug overlay; hits outside it don't block; shifts ride the collider's own tilted
+frame): WidthTop 21.2 / WidthBottom 11.9 / Height 18 / ShiftX −1.1 / ShiftY −0.8 /
+ShiftZ −2.5 / Pitch −4 / Yaw 0 / Roll −90 · FacingDeg 65 (facing gate: blocks only count within this cone of
+the shield's outward normal — enforced at the SOURCE, in `CollisionCheck_SetATvsAC`: a
+bad-angle hit on the shield quad is dropped before the AC_HARD bounce, so no false enemy
+recoil and the attack passes the shield entirely. Judging later in `func_808382DC` was too
+late — the bounce itself is what cancels enemy attacks. ShieldHeld also suspends in hands-off
+states: climbing/hanging/swimming/horse/carrying/dead + B-button-disabled scenes like houses.)
+Speeds: Arm 2.0 / Hit 5.0 / Heavy 8.0 / ReArm 0.8 / MinHand 1.2 (m/s) — user-tuned 2026-08
+Blade: LenKokiri 18 / LenMaster 35 / LenBiggoron 55 / Width 4 / Thickness 0.4 / Roll −90 /
+ShiftFwd 0 / ShiftEdge 1.1 / ShiftFlat 0 / TipTaper 0.2
 Physics: Sword1HFreq 14 / SwordAngFreq 30 / MaxAccel 400 (**do not raise — jitter**) /
-MaxAngAccel 3000 / TouchTolerance 0.3 / Friction 0.3 / PivotOnly 1
+MaxAngAccel 3000 / TouchTolerance 0.3 / Friction 0.5 / PivotOnly 1
 (ContactReach and Bounce were removed 2026-08: vestiges of the impulse solver, never read
 by the position-based sim.)
-Feel: PassthroughSpeed 2.2 / CutDragFlesh 0.55 / CutDragWorld 0.2 / KnockbackScale 1.0 /
-KnockbackCap 8.0 / PressPush 2.5 / FlinchAmount 18 / LimbResist 0.5 / LimbRadius 9 /
-LimbPushMax 22 / MeshRadius 150 / BodyCapsuleRadius 4.5
+Feel: PassthroughSpeed 2.2 / CutDragFlesh 0.97 / CutDragWorld 0.73 / KnockbackScale 0 /
+KnockbackCap 8.0 / PressPush 0 / FlinchAmount 0 / LimbResist 0.5 / LimbRadius 9 /
+LimbPushMax 22 / MeshRadius 150 / BodyCapsuleRadius 4.5 / WeightLagMs 0 / WeightSnapHz 2
+NOTE (user taste, baked 2026-08-03): the M3 hit-feel systems ship OFF by default — knockback,
+press-push, hit flinch and the weight wiggle are all 0; feel comes from heavy cut drag
+(flesh 0.97) instead. Also Hit tier (5.0) is deliberately far above swing-through (2.2):
+swings between 2.2 and 5 m/s cut through flesh with drag but deal no damage.
 Debug: `gVrPhysFlinchTest` 0 (console only; N = lift all limbs N units) / `gVrPhysLog` 0
 
 ## Testing methodology (IMPORTANT — this is how every physics bug here got solved)
@@ -202,7 +237,9 @@ Committed through M2 (`577ec8996` soh / `f863c875` libultraship, both local-only
 **All M3 work is uncommitted** across both repos (VrSwing/VrCombat/debug, z_actor, z_skelanime,
 z_eff_blure, interpreter, vr_physics, menu, this file, tools/).
 
-1. Get the user's final Collider Shift numbers → bake as defaults (roll −90 already done).
+1. DONE 2026-08-03: the user's full tuning pass is baked as defaults (speeds, blade collider,
+   feel, shield collider + facing — see the CVar reference; menu DefaultValues, reader
+   fallbacks and the export button all agree).
 2. Fix pacifist tooltip.
 3. Commit M3 (submodule first, then soh — same pattern as previous commits).
 4. M3 remainder: AT_BOUNCED armor clank + heavy haptic; knockback regression pass on
