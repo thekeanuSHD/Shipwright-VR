@@ -13,11 +13,16 @@ extern SaveContext gSaveContext;
 #include <vr_interface.h>
 #include <cmath>
 
-// M4 physical shield: the shield lives in the off hand whenever it can, and blocking is purely
+// M4 physical shield: the shield lives in the off hand while a melee weapon is VISIBLY in the
+// sword hand (leftHandType — the sword's visibility itself, so the shield leaves the arm the
+// same frame the sword leaves the hand, exactly like the base game), and blocking is purely
 // geometric — an enemy attack that touches the shield quad bounces (the quad's AC_HARD init
 // makes CollisionCheck set AC_BOUNCED) and func_808382DC negates the damage exactly like a
 // vanilla stance block, except there is no stance: no button, no crouch, no movement lock, no
-// reaction animation, no backwards shove. Hold it up = blocked; hand at your side = hit.
+// reaction animation, no backwards shove. Hold it up = blocked; hand at your side = hit. Both
+// vanilla stance entries (crouch in Player_ActionHandler_11, Z-target upper-body in
+// func_80834758) are suppressed at the root while this owns blocking, so their itemAction = -1
+// diverged-models marker can never fire from a grip press.
 //
 // It rides three vanilla gates, all previously keyed on PLAYER_STATE1_SHIELDING (the R-button
 // stance, force-cleared every frame — deliberately NOT set here):
@@ -59,31 +64,41 @@ extern "C" bool VrCombat_ShieldHeld(Player* player) {
         !(CVarGetInteger(CVAR_CHEAT("ShieldTwoHanded"), 0) && (player->heldItemAction != PLAYER_IA_DEKU_STICK))) {
         return false;
     }
-    // SELECTOR MODE: the shield comes out WITH the weapon and goes away with it. The selector is
-    // the only thing that draws or stows anything there, so "up = sword and shield, center =
-    // empty hands" should mean exactly that. Without this the bare-handed case below still counts
-    // as a free off hand — vanilla does let Link raise a shield with nothing drawn — and the
-    // shield never leaves his arm again once it has been taken out.
-    if (VrItemSelect_ModeActive() && (Player_GetMeleeWeaponHeld(player) == 0)) {
-        return false;
+    // The shield rides the off hand exactly while a melee weapon is VISIBLY in the sword hand.
+    // leftHandType is the output of Player_SetModels' central model derivation, so it IS the
+    // sword's visibility: it goes empty in every scenario that stows the sword — real put-aways
+    // AND the visual-only stows (the itemAction = -1 diverged-models family) where
+    // heldItemAction still claims the sword. Keying on it restores the vanilla invariant the
+    // old logical-item deny-list chased case by case (vanilla's stance could only exist in
+    // model-coherent states, so its shield always left with the sword): the shield now leaves
+    // the arm the same frame the sword leaves the hand, everywhere. Bare hands, bow/hookshot,
+    // bottles, boomerang and the ocarina all fall out of the default case. The base-game rule
+    // "the shield unequips with the sword" is deliberate policy here in BOTH control schemes —
+    // classic mode loses vanilla's bare-hand shield raise.
+    switch (player->leftHandType) {
+        case PLAYER_MODELTYPE_LH_SWORD:
+        case PLAYER_MODELTYPE_LH_SWORD_2:
+        case PLAYER_MODELTYPE_LH_BGS:    // broken Giant's Knife / child Master Sword renders here
+        case PLAYER_MODELTYPE_LH_HAMMER: // reachable only with the ShieldTwoHanded cheat
+            break;
+        case PLAYER_MODELTYPE_LH_CLOSED:
+            // The Deku stick has no hand model of its own — it renders separately over a closed
+            // fist (PLAYER_MODELGROUP_10), so the fist plus the stick logically held is its
+            // "visibly in hand". A visual-only stick stow re-derives to an open hand and drops
+            // the shield like every other weapon.
+            if (player->heldItemAction != PLAYER_IA_DEKU_STICK) {
+                return false;
+            }
+            break;
+        default:
+            return false;
     }
-    // The off hand must actually be free: physical melee weapons, bare hands and the Deku
-    // stick qualify; bow/hookshot/bottles/ocarina need the hand and suspend the shield
-    // (matching vanilla, where you cannot shield while aiming or carrying either).
-    if (!VrCombat_MeleeCovered(player) && (player->heldItemAction != PLAYER_IA_NONE) &&
-        (player->heldItemAction != PLAYER_IA_DEKU_STICK)) {
-        return false;
-    }
-    // Hands-off states: climbing, hanging, swimming, riding, carrying — the shield goes back
-    // on Link's back exactly like his other gear.
+    // Hands-off states the model derivation doesn't encode (the sword can stay legitimately
+    // drawn on Epona, but the off hand holds the reins): the shield goes back on Link's back
+    // exactly like his other gear.
     if (player->stateFlags1 &
         (PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE |
          PLAYER_STATE1_IN_WATER | PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_DEAD)) {
-        return false;
-    }
-    // Weapon-restricted scenes (houses, shops — wherever the game disables the B button and
-    // puts Link's weapons away): the shield stays away too.
-    if (gSaveContext.buttonStatus[0] == BTN_DISABLED) {
         return false;
     }
     return true;
@@ -220,9 +235,13 @@ void Shield_OnPlayerUpdate(PlayState* play, Player* player) {
         // inside accepts VrCombat_ShieldHeld). Also converts the sheath model so the shield
         // leaves Link's back while it's in his hand.
         Player_SetModelsForHoldingShield(player);
-    } else if (sWasHeld) {
+    } else if (sWasHeld && player->rightHandType == PLAYER_MODELTYPE_RH_SHIELD) {
         // Falling edge (item change, two-hander drawn, mode off): re-derive hand and sheath
-        // models from the current model group so the shield returns to Link's back.
+        // models from the current model group so the shield returns to Link's back — but ONLY
+        // if the shield is actually still mounted. When the falling edge was CAUSED by the game
+        // re-deriving models itself (a real put-away, or a visual-only stow that leaves
+        // modelGroup pointing at the sword group), the hands are already correct and slamming
+        // modelGroup back would re-equip the sword the game just stowed.
         Player_SetModels(player, player->modelGroup);
     }
     sWasHeld = held;
@@ -230,7 +249,9 @@ void Shield_OnPlayerUpdate(PlayState* play, Player* player) {
 
 void Shield_Deactivate(PlayState* play, Player* player) {
     if (sWasHeld) {
-        Player_SetModels(player, player->modelGroup);
+        if (player->rightHandType == PLAYER_MODELTYPE_RH_SHIELD) {
+            Player_SetModels(player, player->modelGroup); // see the falling-edge note above
+        }
         sWasHeld = false;
     }
     sBlockHapticCooldown = 0;

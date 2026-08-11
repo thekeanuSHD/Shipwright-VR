@@ -45,15 +45,28 @@ static const std::map<int32_t, const char*> vrItemSelInputOptions = {
     { VR_BTN_THUMBCLICK, "Stick Click" }, { VR_BTN_MENU, "Menu Button" },
 };
 
+// Sword-swap chord choices: no Trigger entry (both triggers are reserved for using the held
+// item in selector mode), and 0 turns the chord off.
+static const std::map<int32_t, const char*> vrItemSelSwapOptions = {
+    { 0, "Disabled" },
+    { VR_BTN_GRIP, "Both Grips" },
+    { VR_BTN_PRIMARY, "A + X" },
+    { VR_BTN_SECONDARY, "B + Y" },
+    { VR_BTN_THUMBCLICK, "Both Stick Clicks" },
+    { VR_BTN_MENU, "Both Menu Buttons" },
+};
+
 // --- VR Inputs: N64-button-first binding editor (styled after the base game's bindings window:
 // colored N64 chip per row, removable chips for each bound VR input, "+" to add). All state lives
 // in the gVrBind* mask CVars that padmgr.c reads.
 //
-// There are TWO independent binding sets, picked by gVrItemSelect, so swapping control schemes in
-// the menu never costs you your bindings. Selector mode reserves both TRIGGERS for using the held
-// item, so their rows are hidden and a physical trigger press won't bind; C buttons are left free
-// there because nothing activates items from a C press any more. Defaults must match
-// sVrBindDefaults / sVrBindSelDefaults in padmgr.c.
+// There are THREE independent binding sets. The two GAMEPLAY sets are picked by gVrItemSelect,
+// so swapping control schemes in the menu never costs you your bindings; selector mode reserves
+// both TRIGGERS for using the held item, so their rows won't bind there. The OCARINA set takes
+// over the controllers whenever the ocarina interface is up (in either scheme) — it maps notes,
+// sharps/flats and put-away, and because every selector reservation stands down while playing,
+// notes may live on any input including the triggers. Defaults must match
+// sVrBindDefaults / sVrBindSelDefaults / sVrBindOcaDefaults in padmgr.c.
 struct VrInputDef {
     const char* label;
     const char* cvar;
@@ -75,17 +88,33 @@ static const VrInputDef sVrInputDefsSelector[] = {
     { "A", "gVrBindSelRPrimary", BTN_A },                  { "B", "gVrBindSelRSecondary", BTN_B },
     { "R Stick", "gVrBindSelRStickClick", 0 },             { "R Menu", "gVrBindSelRMenu", 0 },
 };
+static const VrInputDef sVrInputDefsOcarina[] = {
+    { "L Trigger", "gVrBindOcaLTrigger", BTN_CDOWN }, { "L Grip", "gVrBindOcaLGrip", BTN_Z },
+    { "X", "gVrBindOcaLPrimary", BTN_CLEFT },         { "Y", "gVrBindOcaLSecondary", BTN_CUP },
+    { "L Stick", "gVrBindOcaLStickClick", 0 },        { "L Menu", "gVrBindOcaLMenu", 0 },
+    { "R Trigger", "gVrBindOcaRTrigger", BTN_A },     { "R Grip", "gVrBindOcaRGrip", BTN_R },
+    { "A", "gVrBindOcaRPrimary", BTN_CRIGHT },        { "B", "gVrBindOcaRSecondary", BTN_B },
+    { "R Stick", "gVrBindOcaRStickClick", 0 },        { "R Menu", "gVrBindOcaRMenu", 0 },
+};
 static const int kVrInputCount = 12;
+
+// Which set the editor is showing: the active gameplay scheme, or the ocarina set.
+static bool sVrEditOcarina = false;
 
 static bool VrSelectorProfile() {
     return CVarGetInteger("gVrItemSelect", 1) != 0;
 }
 static const VrInputDef* VrInputDefs() {
+    if (sVrEditOcarina) {
+        return sVrInputDefsOcarina;
+    }
     return VrSelectorProfile() ? sVrInputDefsSelector : sVrInputDefsClassic;
 }
-// Indices 0 and 6 are the two triggers: reserved by selector mode, so they are not bindable.
+// Indices 0 and 6 are the two triggers: reserved by selector mode, so they are not bindable —
+// except in the ocarina set, where the reservations don't apply and triggers are prime note real
+// estate.
 static bool VrInputReserved(int idx) {
-    return VrSelectorProfile() && ((idx == 0) || (idx == 6));
+    return !sVrEditOcarina && VrSelectorProfile() && ((idx == 0) || (idx == 6));
 }
 
 struct VrN64RowDef {
@@ -107,7 +136,7 @@ static void VrInputBindingRow(const VrN64RowDef& row) {
     ImGui::PushStyleColor(ImGuiCol_Button, row.color);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, row.color);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, row.color);
-    ImGui::Button(row.label, ImVec2(76.0f, 0.0f));
+    ImGui::Button(row.label, ImVec2(96.0f, 0.0f)); // wide enough for the ocarina note labels
     ImGui::PopStyleColor(3);
 
     // One removable chip per VR input currently bound to this button.
@@ -223,9 +252,47 @@ static void VrInputBindings(WidgetInfo& info) {
         { "D " ICON_FA_ARROW_LEFT, BTN_DLEFT, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
         { "D " ICON_FA_ARROW_RIGHT, BTN_DRIGHT, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
     };
+    // The ocarina set is edited in NOTES, not N64 buttons: each row is the note (with the N64
+    // button it stands for), plus the sharp/flat modifiers, put-away, and the free-play guard
+    // (hold L: songs are not recognized, so nothing interrupts noodling).
+    static const VrN64RowDef sOcarinaRows[] = {
+        { "D4 (A)", BTN_A, ImVec4(0.22f, 0.24f, 0.50f, 1.0f) },
+        { "F4 (C" ICON_FA_ARROW_DOWN ")", BTN_CDOWN, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "A4 (C" ICON_FA_ARROW_RIGHT ")", BTN_CRIGHT, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "B4 (C" ICON_FA_ARROW_LEFT ")", BTN_CLEFT, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "D5 (C" ICON_FA_ARROW_UP ")", BTN_CUP, ImVec4(0.60f, 0.44f, 0.06f, 1.0f) },
+        { "Sharp (R)", BTN_R, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "Flat (Z)", BTN_Z, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+        { "Put Away", BTN_B, ImVec4(0.12f, 0.35f, 0.14f, 1.0f) },
+        { "No Song (L)", BTN_L, ImVec4(0.32f, 0.32f, 0.32f, 1.0f) },
+    };
 
-    // Which of the two binding sets is being edited, and what selector mode has taken off the
-    // table. Both sets are kept independently, so flipping the toggle swaps schemes intact.
+    // Which binding set is being edited. The gameplay tab follows the active scheme
+    // (gVrItemSelect), so flipping the selector toggle swaps schemes with bindings intact; the
+    // ocarina set is its own thing, in force whenever the ocarina interface is up.
+    if (ImGui::RadioButton(VrSelectorProfile() ? "Gameplay (Item Selector)" : "Gameplay (Classic)", !sVrEditOcarina)) {
+        sVrEditOcarina = false;
+        sVrListenRowMask = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Ocarina", sVrEditOcarina)) {
+        sVrEditOcarina = true;
+        sVrListenRowMask = 0;
+    }
+    ImGui::Separator();
+
+    if (sVrEditOcarina) {
+        ImGui::TextWrapped("Editing the OCARINA binding set, used whenever the ocarina is out — in "
+                           "either control scheme. Notes run low to high: D4, F4, A4, B4, D5. The "
+                           "left thumbstick bends pitch, as the analog stick always did. Triggers "
+                           "are NOT reserved here: while playing, every input belongs to the "
+                           "ocarina.");
+        ImGui::Separator();
+        for (const VrN64RowDef& row : sOcarinaRows) {
+            VrInputBindingRow(row);
+        }
+        return;
+    }
     if (VrSelectorProfile()) {
         ImGui::TextWrapped("Editing the ITEM SELECTOR binding set. Both triggers are reserved: the "
                            "trigger of the hand holding an item uses that item. C buttons no "
@@ -1417,6 +1484,17 @@ void SohMenu::AddMenuVRSettings() {
                               "its normal button binding stops firing, and while held, that "
                               "hand's thumbstick is ignored (no turning or C-buttons from a "
                               "resting thumb)."));
+    AddWidget(buttonsPath, "Sword Swap (Both Hands)", WIDGET_CVAR_COMBOBOX)
+        .CVar("gVrItemSelSwapInput")
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrItemSelect", 1); })
+        .Options(ComboboxOptions()
+                     .DefaultIndex(VR_BTN_GRIP)
+                     .ComboMap(vrItemSelSwapOptions)
+                     .Tooltip("Quick swap back to sword & shield: squeeze this input on BOTH "
+                              "controllers at once to stow whatever you're holding and draw the "
+                              "sword (the shield already rides your off hand). While both are "
+                              "down, the inputs' normal bindings pause so the swap doesn't also "
+                              "Z-target or raise R; squeezed alone they work as bound."));
     AddWidget(buttonsPath, "Flick Distance: %.0f cm", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVrItemSelDistance")
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger("gVrItemSelect", 1); })

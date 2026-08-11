@@ -2823,6 +2823,16 @@ s32 func_80834758(PlayState* play, Player* this) {
     LinkAnimationHeader* anim;
     f32 frame;
 
+    // SOH [VR] Physical shield: the Z-target upper-body stance is retired while the physical
+    // shield owns blocking — the block is wherever the physically-held shield is. This entry is
+    // reachable from the grip's R binding while lock-on is toggled, and it would set the stance's
+    // itemAction = -1 diverged-models marker outside the action lifecycle that repairs it.
+    // Suppressed at the root so none of its side effects ever start (the crouch stance entry in
+    // Player_ActionHandler_11 already is); with gVrPhysShield off, everything stays vanilla.
+    if (VrCombat_Active() && CVarGetInteger("gVrPhysShield", 1) && (this->actor.category == ACTORCAT_PLAYER)) {
+        return 0;
+    }
+
     if (!(this->stateFlags1 & (PLAYER_STATE1_SHIELDING | PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_IN_CUTSCENE)) &&
         (play->shootingGalleryStatus == 0) && (this->heldItemAction == this->itemAction) &&
         (this->currentShield != PLAYER_SHIELD_NONE) && !Player_IsChildWithHylianShield(this) &&

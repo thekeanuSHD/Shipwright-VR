@@ -124,6 +124,19 @@ uint16_t SelectorMask() {
     return (uint16_t)CVarGetInteger("gVrItemSelInput", VR_BTN_THUMBCLICK);
 }
 
+// Quick swap to sword & shield: squeeze the configured input on BOTH controllers at once. A
+// two-hand chord on purpose — either input alone keeps its normal binding (the grips carry
+// Z-target and R in the selector profile), so the swap needs a gesture no single binding owns.
+uint16_t SwapMask() {
+    return (uint16_t)CVarGetInteger("gVrItemSelSwapInput", VR_BTN_GRIP);
+}
+
+bool SwapChordHeld() {
+    const uint16_t mask = SwapMask();
+    return mask != 0 && (VR_GetControllerButton(VR_HAND_LEFT) & mask) != 0 &&
+           (VR_GetControllerButton(VR_HAND_RIGHT) & mask) != 0;
+}
+
 float PickThresholdUnits() {
     float ws = VR_GetWorldScale();
     if (ws < 1.0f) {
@@ -132,8 +145,23 @@ float PickThresholdUnits() {
     return CVarGetFloat("gVrItemSelDistance", 5.0f) * 0.01f * ws; // cm -> game units
 }
 
+// The ocarina interface owns the controllers while it is up. Every msgMode from OCARINA_STARTING
+// through FROGS_WAITING is a state of that interface (free play, song playback and demonstration,
+// scarecrow recording, the frog and Skull Kid minigames), and while any of them is active the
+// dedicated OCARINA binding set in padmgr is in force: notes may sit on ANY input, so the
+// selector's reservations (its opening click, both triggers, the held-item trigger mirror) all
+// stand down below, and the selector itself refuses to open (SelectorAvailable) — changing items
+// mid-song makes no sense and would eat a note input.
+bool OcarinaInPlay() {
+    return gPlayState != NULL && gPlayState->msgCtx.msgMode >= MSGMODE_OCARINA_STARTING &&
+           gPlayState->msgCtx.msgMode <= MSGMODE_FROGS_WAITING;
+}
+
 bool SelectorAvailable() {
     if (!CVarGetInteger("gVrItemSelect", 1)) {
+        return false;
+    }
+    if (OcarinaInPlay()) {
         return false;
     }
     if (!VR_IsInitialized() || !VR_GetFirstPerson() || VR_IsFlatScreen()) {
@@ -192,10 +220,33 @@ void ExecuteSector(int sector) {
     }
 }
 
+// Rising edge of the two-grip chord: stow whatever is held and draw the sword, exactly the
+// selector's UP sector (the shield needs nothing — it rides the off hand under VrShield's own
+// rules). Already holding a melee weapon = nothing to do. Skipped while the compass is open;
+// the selector owns that interaction.
+void QuickSwapTick() {
+    static bool sChordPrev = false;
+    const bool chord = SwapChordHeld();
+    const bool rising = chord && !sChordPrev;
+    sChordPrev = chord;
+    if (!rising || sOpen || !SelectorAvailable()) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == NULL || Player_GetMeleeWeaponHeld(player) != 0) {
+        return;
+    }
+    sEquipGrace = 3;
+    GameInteractor::RawAction::EmulateButtonPress(BTN_B);
+    VR_TriggerHaptic(VR_HAND_LEFT, 0.4f, 0.0f, 25.0f);
+    VR_TriggerHaptic(VR_HAND_RIGHT, 0.4f, 0.0f, 25.0f);
+}
+
 void ItemSelectTick() {
     if (sEquipGrace > 0) {
         sEquipGrace--;
     }
+    QuickSwapTick();
     const bool avail = SelectorAvailable();
 
     if (!sOpen) {
@@ -442,10 +493,28 @@ extern "C" void VrItemSelect_Draw(void) {
 extern "C" bool VrItemSelect_ConsumesInput(int32_t vrHand, uint16_t vrBtnMask) {
     // The configured selector input is DEDICATED while the feature is enabled: padmgr never
     // feeds it to the button bindings, so the opening click can't leak its normal action.
-    if (!CVarGetInteger("gVrItemSelect", 1)) {
+    // Except while the ocarina is up — the selector can't open then, so its input goes back
+    // to the (ocarina) bindings like any other.
+    if (!CVarGetInteger("gVrItemSelect", 1) || OcarinaInPlay()) {
         return false;
     }
     return vrHand == SelectorHand() && (vrBtnMask & SelectorMask()) != 0;
+}
+
+extern "C" bool VrOcarina_InPlay(void) {
+    return OcarinaInPlay();
+}
+
+extern "C" bool VrItemSelect_SwapConsumed(int32_t vrHand, uint16_t vrBtnMask) {
+    // The chord's inputs keep their normal bindings when squeezed alone (the grips stay
+    // Z-target / R); only while BOTH hands hold the chord input are those bindings suspended,
+    // so the swap doesn't also recenter the camera or flash a shield stance. Stands down
+    // during ocarina play like every other selector reservation.
+    (void)vrHand;
+    if (!CVarGetInteger("gVrItemSelect", 1) || OcarinaInPlay()) {
+        return false;
+    }
+    return (vrBtnMask & SwapMask()) != 0 && SwapChordHeld();
 }
 
 extern "C" bool VrItemSelect_ModeActive(void) {
@@ -454,6 +523,11 @@ extern "C" bool VrItemSelect_ModeActive(void) {
 
 extern "C" uint16_t VrItemSelect_TriggerItemMask(int32_t vrHand) {
     if (!SelectorModeInPlay() || gPlayState == NULL) {
+        return 0;
+    }
+    // While the ocarina is up its own binding set rules: without this, the holding hand's
+    // trigger would keep mirroring the ocarina's equip C button and blare that note.
+    if (OcarinaInPlay()) {
         return 0;
     }
     Player* player = GET_PLAYER(gPlayState);
@@ -473,9 +547,10 @@ extern "C" bool VrItemSelect_TriggerConsumed(int32_t vrHand, uint16_t vrBtnMask)
     // Both triggers belong to item use while the mode is on, held item or not — see the header
     // comment on why they don't fall back to a binding when the hands are empty. Not gated on
     // first person: the selector profile leaves the triggers unbound anyway, so reserving them
-    // everywhere keeps the meaning of a trigger squeeze the same in every view.
+    // everywhere keeps the meaning of a trigger squeeze the same in every view. The one
+    // exception is the ocarina interface, whose binding set puts NOTES on the triggers.
     (void)vrHand;
-    return CVarGetInteger("gVrItemSelect", 1) && (vrBtnMask & VR_BTN_TRIGGER) != 0;
+    return CVarGetInteger("gVrItemSelect", 1) && !OcarinaInPlay() && (vrBtnMask & VR_BTN_TRIGGER) != 0;
 }
 
 static void RegisterVrItemSelect() {

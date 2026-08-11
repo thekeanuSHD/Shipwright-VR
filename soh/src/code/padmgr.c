@@ -339,8 +339,8 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
             // CLASSIC (selector off): items are activated by the C buttons you assigned them to.
             // Defaults: left = Z-target, R-shield, C-left, C-right, Start (stick click), none;
             //           right = B-sword, none, A, C-down, none, none.
-            // C-Up ships deliberately UNBOUND (it is an ocarina note — the player assigns it
-            // wherever suits their controller in VR Settings -> VR Inputs).
+            // C-Up ships deliberately UNBOUND — ocarina notes come from the dedicated OCARINA
+            // set below, so no gameplay binding needs to carry a note.
             static const char* sVrBindCvars[2][6] = {
                 { "gVrBindLTrigger", "gVrBindLGrip", "gVrBindLPrimary", "gVrBindLSecondary", "gVrBindLStickClick",
                   "gVrBindLMenu" },
@@ -353,8 +353,9 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
             };
             // SELECTOR (selector on): the Alyx-style selector equips and the holding hand's
             // TRIGGER uses the item, so both triggers are reserved (unbound, and skipped below)
-            // and the C buttons no longer pull anything out — they are left unbound here, free
-            // for the ocarina to claim as notes. Everything the triggers used to carry moves:
+            // and the C buttons no longer pull anything out — they are left unbound here
+            // (ocarina notes live in the dedicated set below). Everything the triggers used to
+            // carry moves:
             // Z-target to the sword-hand grip, the shield stays on the off-hand grip, A and B
             // on the face buttons. Start is bound on BOTH the left stick click and the left menu
             // button, because whichever stick click the selector is set to is eaten by it.
@@ -369,28 +370,54 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
                 { 0, BTN_R, 0, 0, BTN_START, BTN_START },
                 { 0, BTN_Z, BTN_A, BTN_B, 0, 0 },
             };
+            // OCARINA (the ocarina interface is up, in EITHER profile): the five notes get their
+            // own bindable set, because neither gameplay profile has all five note buttons — in
+            // selector mode the C notes had NOTHING to live on, which made the ocarina unplayable.
+            // While VrOcarina_InPlay() this set replaces the gameplay bindings outright and every
+            // selector reservation stands down (both triggers, the selector click, the held-item
+            // trigger mirror — see VrItemSelect.cpp), so notes may sit anywhere. Defaults, notes
+            // low to high: D4 (A) = R trigger, F4 (C-down) = L trigger, A4 (C-right) = A,
+            // B4 (C-left) = X, D5 (C-up) = Y; sharpen (R) = right grip, flatten (Z) = left grip;
+            // B (put the ocarina away) = B button. Pitch bend rides the left thumbstick, which is
+            // already the N64 analog stick below. Keep in sync with sVrInputDefsOcarina in
+            // SohMenuVRSettings.cpp.
+            static const char* sVrBindOcaCvars[2][6] = {
+                { "gVrBindOcaLTrigger", "gVrBindOcaLGrip", "gVrBindOcaLPrimary", "gVrBindOcaLSecondary",
+                  "gVrBindOcaLStickClick", "gVrBindOcaLMenu" },
+                { "gVrBindOcaRTrigger", "gVrBindOcaRGrip", "gVrBindOcaRPrimary", "gVrBindOcaRSecondary",
+                  "gVrBindOcaRStickClick", "gVrBindOcaRMenu" },
+            };
+            static const s32 sVrBindOcaDefaults[2][6] = {
+                { BTN_CDOWN, BTN_Z, BTN_CLEFT, BTN_CUP, 0, 0 },
+                { BTN_A, BTN_R, BTN_CRIGHT, BTN_B, 0, 0 },
+            };
             static const u16 sVrBtnMasks[6] = { VR_BTN_TRIGGER,   VR_BTN_GRIP,       VR_BTN_PRIMARY,
                                                 VR_BTN_SECONDARY, VR_BTN_THUMBCLICK, VR_BTN_MENU };
             s32 vrSelProfile = CVarGetInteger("gVrItemSelect", 1);
+            s32 vrOcarina = VrOcarina_InPlay();
             s32 vrHandIdx, vrBtnIdx;
             for (vrHandIdx = 0; vrHandIdx < 2; vrHandIdx++) {
                 uint16_t vrState = (vrHandIdx == 0) ? vrL : vrR;
                 for (vrBtnIdx = 0; vrBtnIdx < 6; vrBtnIdx++) {
                     // SOH [VR] The Alyx-style item selector owns its configured input outright:
                     // its normal binding never fires (the opening click must not leak). In
-                    // selector mode both triggers belong to item use. While aiming a projectile
-                    // (classic mode), the aim hand's trigger is the FIRE control and its binding
-                    // is likewise suspended.
+                    // selector mode both triggers belong to item use, and the two-hand quick-swap
+                    // chord suspends its inputs' bindings while fully held. While aiming a
+                    // projectile (classic mode), the aim hand's trigger is the FIRE control and
+                    // its binding is likewise suspended.
                     if (VrItemSelect_ConsumesInput(vrHandIdx, sVrBtnMasks[vrBtnIdx]) ||
                         VrItemSelect_TriggerConsumed(vrHandIdx, sVrBtnMasks[vrBtnIdx]) ||
+                        VrItemSelect_SwapConsumed(vrHandIdx, sVrBtnMasks[vrBtnIdx]) ||
                         VrCombat_AimTriggerConsumed(vrHandIdx, sVrBtnMasks[vrBtnIdx])) {
                         continue;
                     }
                     if (vrState & sVrBtnMasks[vrBtnIdx]) {
-                        s32 mapped = vrSelProfile ? CVarGetInteger(sVrBindSelCvars[vrHandIdx][vrBtnIdx],
-                                                                   sVrBindSelDefaults[vrHandIdx][vrBtnIdx])
-                                                  : CVarGetInteger(sVrBindCvars[vrHandIdx][vrBtnIdx],
-                                                                   sVrBindDefaults[vrHandIdx][vrBtnIdx]);
+                        s32 mapped = vrOcarina      ? CVarGetInteger(sVrBindOcaCvars[vrHandIdx][vrBtnIdx],
+                                                                     sVrBindOcaDefaults[vrHandIdx][vrBtnIdx])
+                                     : vrSelProfile ? CVarGetInteger(sVrBindSelCvars[vrHandIdx][vrBtnIdx],
+                                                                     sVrBindSelDefaults[vrHandIdx][vrBtnIdx])
+                                                    : CVarGetInteger(sVrBindCvars[vrHandIdx][vrBtnIdx],
+                                                                     sVrBindDefaults[vrHandIdx][vrBtnIdx]);
                         // Mask to the real pad bits (drops the PC-only modifier bits if selected).
                         vrPad->button |= (u16)(mapped & 0xFFFF);
                     }

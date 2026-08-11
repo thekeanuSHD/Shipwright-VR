@@ -100,6 +100,20 @@ bool VrItemSelect_ModeActive(void);
 uint16_t VrItemSelect_TriggerItemMask(int32_t vrHand);
 bool VrItemSelect_TriggerConsumed(int32_t vrHand, uint16_t vrBtnMask);
 
+// Quick swap to sword & shield (selector mode): squeezing the configured input
+// (gVrItemSelSwapInput, default grip) on BOTH controllers at once stows the held item and draws
+// the sword. True while the full chord is down for a matching input — padmgr skips its normal
+// binding on both hands, so the swap doesn't also emit Z-target / R. Single-hand squeezes keep
+// their bindings untouched.
+bool VrItemSelect_SwapConsumed(int32_t vrHand, uint16_t vrBtnMask);
+
+// True while the ocarina interface is up (free play, song playback, scarecrow recording, the
+// frog and Skull Kid minigames — every msgMode from OCARINA_STARTING through FROGS_WAITING).
+// While true, padmgr swaps to the dedicated OCARINA binding set (sVrBindOca*) and every
+// selector-mode input reservation stands down, so notes can live on any input — including the
+// triggers and the selector's own click.
+bool VrOcarina_InPlay(void);
+
 // Projectile fire (VR first person, independent of physical combat): the walk-while-aiming
 // path only fires on the vanilla item-button RELEASE, so the aim hand's trigger is wired in
 // as the natural VR fire. FirePressed: rising edge of that trigger this tick (checked in the
