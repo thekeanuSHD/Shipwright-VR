@@ -461,3 +461,6 @@ soh/properties.h
 /clang-format
 /clang-format.exe
 *.o2r
+
+# Claude working docs (design notes, plans)
+/markdowns/
