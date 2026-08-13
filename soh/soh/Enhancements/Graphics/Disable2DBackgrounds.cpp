@@ -9,7 +9,7 @@ extern PlayState* gPlayState;
 }
 
 #define CVAR_NAME CVAR_ENHANCEMENT("3DSceneRender")
-#define CVAR_VALUE CVarGetInteger(CVAR_NAME, 0)
+#define CVAR_VALUE CVarGetInteger(CVAR_NAME, 1)
 
 std::set<SceneID> fogControlList = {
     SCENE_MARKET_ENTRANCE_DAY,

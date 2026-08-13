@@ -1542,7 +1542,7 @@ s32 Player_OverrideLimbDrawGameplayVRFirstPerson(PlayState* play, s32 limbIndex,
     // items ride the hand matrices, so sword/shield stay visible). With motion hands off, the
     // hands belong to the body's arms, so everything hides. Third person is unaffected (it uses
     // the normal draw path).
-    if (CVarGetInteger("gVrHideBody", 0)) {
+    if (CVarGetInteger("gVrHideBody", 1)) {
         s32 vrIsHandLimb = (limbIndex == PLAYER_LIMB_L_HAND) || (limbIndex == PLAYER_LIMB_R_HAND);
         if (!(vrIsHandLimb && CVarGetInteger("gVrMotionHands", 1))) {
             *dList = NULL;

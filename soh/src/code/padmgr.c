@@ -328,6 +328,10 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
         OSContPad* vrPad = &padMgr->pads[0];
         uint16_t vrL = VR_GetControllerButton(VR_HAND_LEFT);
         uint16_t vrR = VR_GetControllerButton(VR_HAND_RIGHT);
+        // Set per hand while the ocarina stick-direction bindings claim that thumbstick (see the
+        // ocarina block below): the stick's stock job stands down for the duration so a bound
+        // direction never double-fires alongside it.
+        s32 vrOcaStickClaimed[2] = { 0, 0 };
 
         // Assignable VR input -> N64 button mapping, configured in VR Settings -> VR Inputs. Each
         // CVar holds an N64 BUTTON BITMASK (same encoding as the base game's button-combination
@@ -391,6 +395,18 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
                 { BTN_CDOWN, BTN_Z, BTN_CLEFT, BTN_CUP, 0, 0 },
                 { BTN_A, BTN_R, BTN_CRIGHT, BTN_B, 0, 0 },
             };
+            // OCARINA stick directions: in this set ONLY, the four cardinal deflections of each
+            // thumbstick are bindable inputs too (gameplay sticks keep their stock jobs: move and
+            // turn). Dominant-axis with the same 0.5 threshold as the stock C-stick mapping, so a
+            // diagonal flick plays one note, not two. All unbound by default. A hand with any
+            // direction bound claims that stick outright — vrOcaStickClaimed above — standing
+            // down its stock ocarina job (left: pitch bend / analog stick; right: third-person
+            // C-stick). Order: up, down, left, right. Keep in sync with sVrInputDefsOcarina in
+            // SohMenuVRSettings.cpp.
+            static const char* sVrBindOcaStickCvars[2][4] = {
+                { "gVrBindOcaLStickUp", "gVrBindOcaLStickDown", "gVrBindOcaLStickLeft", "gVrBindOcaLStickRight" },
+                { "gVrBindOcaRStickUp", "gVrBindOcaRStickDown", "gVrBindOcaRStickLeft", "gVrBindOcaRStickRight" },
+            };
             static const u16 sVrBtnMasks[6] = { VR_BTN_TRIGGER,   VR_BTN_GRIP,       VR_BTN_PRIMARY,
                                                 VR_BTN_SECONDARY, VR_BTN_THUMBCLICK, VR_BTN_MENU };
             s32 vrSelProfile = CVarGetInteger("gVrItemSelect", 1);
@@ -435,13 +451,43 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
                     vrPad->button |= VrItemSelect_TriggerItemMask(vrHandIdx);
                 }
             }
+
+            // SOH [VR] Ocarina stick-direction bindings (sVrBindOcaStickCvars above): fire the
+            // bound mask while the dominant axis holds past the threshold — raw button STATE,
+            // like everything else here, so press/rel derive naturally.
+            if (vrOcarina) {
+                for (vrHandIdx = 0; vrHandIdx < 2; vrHandIdx++) {
+                    s32 vrDirIdx;
+                    s32 vrHeldDir = -1;
+                    float vrSx = 0.0f, vrSy = 0.0f;
+                    for (vrDirIdx = 0; vrDirIdx < 4; vrDirIdx++) {
+                        if (CVarGetInteger(sVrBindOcaStickCvars[vrHandIdx][vrDirIdx], 0) != 0) {
+                            vrOcaStickClaimed[vrHandIdx] = 1;
+                        }
+                    }
+                    if (!vrOcaStickClaimed[vrHandIdx]) {
+                        continue;
+                    }
+                    VR_GetThumbstick(vrHandIdx, &vrSx, &vrSy);
+                    if ((vrSy * vrSy) >= (vrSx * vrSx)) {
+                        vrHeldDir = (vrSy > 0.5f) ? 0 : (vrSy < -0.5f) ? 1 : -1;
+                    } else {
+                        vrHeldDir = (vrSx < -0.5f) ? 2 : (vrSx > 0.5f) ? 3 : -1;
+                    }
+                    if (vrHeldDir >= 0) {
+                        s32 mapped = CVarGetInteger(sVrBindOcaStickCvars[vrHandIdx][vrHeldDir], 0);
+                        // Mask to the real pad bits (drops the PC-only modifier bits if selected).
+                        vrPad->button |= (u16)(mapped & 0xFFFF);
+                    }
+                }
+            }
         }
 
         // Left thumbstick -> movement (control stick). Overrides only when actually pushed (deadzone),
         // so it doesn't zero out a keyboard/gamepad stick when idle.
         float lx = 0.0f, ly = 0.0f;
         VR_GetThumbstick(VR_HAND_LEFT, &lx, &ly);
-        if (((lx * lx) + (ly * ly)) > (0.15f * 0.15f)) {
+        if (!vrOcaStickClaimed[VR_HAND_LEFT] && ((lx * lx) + (ly * ly)) > (0.15f * 0.15f)) {
             vrPad->stick_x = (s8)CLAMP(lx * 127.0f, -128.0f, 127.0f);
             vrPad->stick_y = (s8)CLAMP(ly * 127.0f, -128.0f, 127.0f);
         }
@@ -453,7 +499,7 @@ void PadMgr_HandleRetraceMsg(PadMgr* padMgr) {
         // Inputs and the Alyx-style selector, and the X axis belongs to artificial turning.
         float rx = 0.0f, ry = 0.0f;
         VR_GetThumbstick(VR_HAND_RIGHT, &rx, &ry);
-        if (VR_IsFlatScreen() || !VR_GetFirstPerson()) {
+        if (!vrOcaStickClaimed[VR_HAND_RIGHT] && (VR_IsFlatScreen() || !VR_GetFirstPerson())) {
             if (ry > 0.5f) vrPad->button |= BTN_CUP;
             if (ry < -0.5f) vrPad->button |= BTN_CDOWN;
             if (rx > 0.5f) vrPad->button |= BTN_CRIGHT;

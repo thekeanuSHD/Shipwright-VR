@@ -614,14 +614,15 @@ void SohMenu::AddMenuEnhancements() {
     AddWidget(path, "Disable 2D Pre-Rendered Scenes", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("3DSceneRender"))
         .RaceDisable(false)
-        .Options(CheckboxOptions().Tooltip("Disables 2D pre-rendered backgrounds. Enable this when using a mod that "
-                                           "implements 3D backdrops for these areas.\n"
-                                           "Requires Scene Change to alter."));
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Disables 2D pre-rendered backgrounds. Enable this when using a mod that "
+            "implements 3D backdrops for these areas.\n"
+            "Requires Scene Change to alter."));
     AddWidget(path, "Disable Fixed Camera", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("DisableFixedCamera"))
         .RaceDisable(false)
         .PreFunc([](WidgetInfo& info) {
-            if (CVarGetInteger(CVAR_ENHANCEMENT("3DSceneRender"), 0) == 0) {
+            if (CVarGetInteger(CVAR_ENHANCEMENT("3DSceneRender"), 1) == 0) {
                 CVarSetInteger(CVAR_ENHANCEMENT("DisableFixedCamera"), 0);
                 info.options->disabled = true;
             } else {
@@ -629,7 +630,7 @@ void SohMenu::AddMenuEnhancements() {
             }
             info.options->disabledTooltip = "Requires \"Disable 2D Pre-Rendered Scenes\" to be enabled.";
         })
-        .Options(CheckboxOptions().Tooltip(
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Disables the fixed camera in maps that use 2D pre-rendered backgrounds. Enable this when using a mod "
             "that implements 3D backdrops for these areas.\n"
             "Requires Scene Change to alter."));

@@ -95,8 +95,21 @@ static const VrInputDef sVrInputDefsOcarina[] = {
     { "R Trigger", "gVrBindOcaRTrigger", BTN_A },     { "R Grip", "gVrBindOcaRGrip", BTN_R },
     { "A", "gVrBindOcaRPrimary", BTN_CRIGHT },        { "B", "gVrBindOcaRSecondary", BTN_B },
     { "R Stick", "gVrBindOcaRStickClick", 0 },        { "R Menu", "gVrBindOcaRMenu", 0 },
+    // Stick DIRECTIONS, bindable in the ocarina set only (indices 12+, order up/down/left/right
+    // per hand — the listener below computes 12 + hand * 4 + dir). A hand with any direction
+    // bound claims that whole stick while playing: its stock job (left: pitch bend; right:
+    // third-person C-stick) stands down. Matches sVrBindOcaStickCvars in padmgr.c.
+    { "L Stick " ICON_FA_ARROW_UP, "gVrBindOcaLStickUp", 0 },
+    { "L Stick " ICON_FA_ARROW_DOWN, "gVrBindOcaLStickDown", 0 },
+    { "L Stick " ICON_FA_ARROW_LEFT, "gVrBindOcaLStickLeft", 0 },
+    { "L Stick " ICON_FA_ARROW_RIGHT, "gVrBindOcaLStickRight", 0 },
+    { "R Stick " ICON_FA_ARROW_UP, "gVrBindOcaRStickUp", 0 },
+    { "R Stick " ICON_FA_ARROW_DOWN, "gVrBindOcaRStickDown", 0 },
+    { "R Stick " ICON_FA_ARROW_LEFT, "gVrBindOcaRStickLeft", 0 },
+    { "R Stick " ICON_FA_ARROW_RIGHT, "gVrBindOcaRStickRight", 0 },
 };
-static const int kVrInputCount = 12;
+static const int kVrButtonInputCount = 12;
+static const int kVrOcarinaInputCount = 20; // buttons + the 8 stick directions
 
 // Which set the editor is showing: the active gameplay scheme, or the ocarina set.
 static bool sVrEditOcarina = false;
@@ -109,6 +122,17 @@ static const VrInputDef* VrInputDefs() {
         return sVrInputDefsOcarina;
     }
     return VrSelectorProfile() ? sVrInputDefsSelector : sVrInputDefsClassic;
+}
+static int VrInputCount() {
+    return sVrEditOcarina ? kVrOcarinaInputCount : kVrButtonInputCount;
+}
+// Dominant-axis stick direction: 0 up, 1 down, 2 left, 3 right, -1 centered. Must match the
+// firing logic in padmgr.c so what binds here is what plays there.
+static int VrStickDir(float x, float y) {
+    if ((y * y) >= (x * x)) {
+        return (y > 0.5f) ? 0 : (y < -0.5f) ? 1 : -1;
+    }
+    return (x < -0.5f) ? 2 : (x > 0.5f) ? 3 : -1;
 }
 // Indices 0 and 6 are the two triggers: reserved by selector mode, so they are not bindable —
 // except in the ocarina set, where the reservations don't apply and triggers are prime note real
@@ -128,6 +152,9 @@ struct VrN64RowDef {
 // when listening starts doesn't instantly bind).
 static uint16_t sVrListenRowMask = 0;
 static uint16_t sVrListenPrevBtn[2] = { 0, 0 };
+// Previous frame's stick direction per hand (VrStickDir result), for the same rising-edge rule:
+// a stick already deflected when listening starts must not instantly bind.
+static int sVrListenPrevStickDir[2] = { -1, -1 };
 
 static void VrInputBindingRow(const VrN64RowDef& row) {
     ImGui::PushID(row.label);
@@ -140,7 +167,7 @@ static void VrInputBindingRow(const VrN64RowDef& row) {
     ImGui::PopStyleColor(3);
 
     // One removable chip per VR input currently bound to this button.
-    for (int i = 0; i < kVrInputCount; i++) {
+    for (int i = 0; i < VrInputCount(); i++) {
         const VrInputDef& input = VrInputDefs()[i];
         int32_t cur = VrInputReserved(i) ? 0 : CVarGetInteger(input.cvar, input.defaultMask);
         if (cur & row.mask) {
@@ -193,6 +220,21 @@ static void VrInputBindingRow(const VrN64RowDef& row) {
                 }
             }
         }
+        // Stick directions are bindable in the ocarina set only: a fresh deflection past the
+        // threshold binds this row to that direction.
+        for (int hand = 0; sVrEditOcarina && hand < 2 && sVrListenRowMask != 0; hand++) {
+            float sx = 0.0f, sy = 0.0f;
+            VR_GetThumbstick(hand, &sx, &sy);
+            const int dir = VrStickDir(sx, sy);
+            const bool fresh = (dir >= 0) && (dir != sVrListenPrevStickDir[hand]);
+            sVrListenPrevStickDir[hand] = dir;
+            if (fresh) {
+                const VrInputDef& input = VrInputDefs()[12 + hand * 4 + dir];
+                CVarSetInteger(input.cvar, CVarGetInteger(input.cvar, input.defaultMask) | row.mask);
+                CVarSave();
+                sVrListenRowMask = 0;
+            }
+        }
     } else {
         // Blue "+": in VR, listen for a physical press; outside VR, fall back to a picker list.
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.65f, 1.0f));
@@ -201,8 +243,12 @@ static void VrInputBindingRow(const VrN64RowDef& row) {
         if (ImGui::SmallButton("+")) {
             if (VR_IsInitialized()) {
                 sVrListenRowMask = row.mask;
-                sVrListenPrevBtn[0] = VR_GetControllerButton(0);
-                sVrListenPrevBtn[1] = VR_GetControllerButton(1);
+                for (int hand = 0; hand < 2; hand++) {
+                    sVrListenPrevBtn[hand] = VR_GetControllerButton(hand);
+                    float sx = 0.0f, sy = 0.0f;
+                    VR_GetThumbstick(hand, &sx, &sy);
+                    sVrListenPrevStickDir[hand] = VrStickDir(sx, sy);
+                }
             } else {
                 ImGui::OpenPopup("VrAddBinding");
             }
@@ -213,7 +259,7 @@ static void VrInputBindingRow(const VrN64RowDef& row) {
                                                  : "Pick a VR input to bind (VR not active)");
         }
         if (ImGui::BeginPopup("VrAddBinding")) {
-            for (int i = 0; i < kVrInputCount; i++) {
+            for (int i = 0; i < VrInputCount(); i++) {
                 if (VrInputReserved(i)) {
                     continue;
                 }
@@ -286,7 +332,10 @@ static void VrInputBindings(WidgetInfo& info) {
                            "either control scheme. Notes run low to high: D4, F4, A4, B4, D5. The "
                            "left thumbstick bends pitch, as the analog stick always did. Triggers "
                            "are NOT reserved here: while playing, every input belongs to the "
-                           "ocarina.");
+                           "ocarina. Thumbstick DIRECTIONS are bindable too (flick the stick while "
+                           "a row is listening); binding any direction on a stick gives that whole "
+                           "stick to notes while playing — left stick loses pitch bend, right "
+                           "stick loses its C-stick role.");
         ImGui::Separator();
         for (const VrN64RowDef& row : sOcarinaRows) {
             VrInputBindingRow(row);
@@ -643,7 +692,7 @@ void SohMenu::AddMenuVRSettings() {
             "Link's own left-handedness) instead of the right."));
     AddWidget(gameplayPath, "Hide Link's Body", WIDGET_CVAR_CHECKBOX)
         .CVar("gVrHideBody")
-        .Options(CheckboxOptions().Tooltip(
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "First person only: don't draw Link's body - just the floating hands and whatever "
             "they hold (the classic VR style). Some players prefer it because the body can block "
             "the view when looking down, and its animations don't always match what you're "
@@ -673,7 +722,7 @@ void SohMenu::AddMenuVRSettings() {
 
     AddWidget(physPath, "Physical Combat (Experimental)", WIDGET_CVAR_CHECKBOX)
         .CVar("gVrPhysCombat")
-        .Options(CheckboxOptions().Tooltip(
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Physics-driven combat: swing the sword yourself (swing speed decides the hit), "
             "block by physically holding the shield up, grab pots with both hands, draw the bow "
             "for real. Replaces button combat only in VR first person; cutscenes, minigames and "

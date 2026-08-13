@@ -109,7 +109,7 @@ extern "C" bool VrCombat_AimTriggerConsumed(int32_t vrHand, uint16_t vrBtnMask) 
 }
 
 extern "C" bool VrCombat_Active(void) {
-    if (!CVarGetInteger("gVrPhysCombat", 0) || !InterfaceOk()) {
+    if (!CVarGetInteger("gVrPhysCombat", 1) || !InterfaceOk()) {
         return false;
     }
     if (!VR_IsInitialized() || !VR_GetFirstPerson()) {
